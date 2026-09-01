@@ -1,0 +1,545 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <meta charset="utf-8">
+  <style>
+    :root {
+      --primary: #0f6e84;
+      --primary-dark: #0b5566;
+      --primary-light: #e6f4f7;
+      --accent: #2f9e8f;
+      --accent-dark: #268a7d;
+      --text: #1f2937;
+      --text-muted: #6b7280;
+      --border: #d8e3e6;
+      --success-bg: #e6f6ee;
+      --success-text: #1b7f4d;
+      --error-bg: #fdecea;
+      --error-text: #b3261e;
+      --bg: #f4f8f9;
+      --card-bg: #ffffff;
+      --radius: 8px;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      font-size: 13px;
+    }
+
+    .header {
+      background: linear-gradient(135deg, var(--primary), var(--primary-dark));
+      color: #fff;
+      padding: 16px 14px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .header svg {
+      flex-shrink: 0;
+    }
+
+    .header h1 {
+      font-size: 14px;
+      line-height: 1.35;
+      margin: 0;
+      font-weight: 600;
+    }
+
+    .container {
+      padding: 14px;
+    }
+
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 14px;
+      margin-bottom: 14px;
+      box-shadow: 0 1px 3px rgba(15, 110, 132, 0.08);
+    }
+
+    .card h2 {
+      font-size: 11.5px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--primary);
+      margin: 0 0 10px;
+      display: flex;
+      align-items: center;
+      gap: 7px;
+    }
+
+    .step-badge {
+      background: var(--primary);
+      color: #fff;
+      width: 16px;
+      height: 16px;
+      border-radius: 50%;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 10px;
+      flex-shrink: 0;
+    }
+
+    .hint {
+      margin: -4px 0 10px;
+      font-size: 11.5px;
+      color: var(--text-muted);
+      line-height: 1.4;
+    }
+
+    input[type="file"] {
+      width: 100%;
+      font-size: 12px;
+      padding: 6px 0;
+    }
+
+    .preview-img {
+      display: none;
+      max-width: 100%;
+      border-radius: 6px;
+      margin-top: 10px;
+      border: 1px solid var(--border);
+    }
+
+    button {
+      width: 100%;
+      border: none;
+      border-radius: 6px;
+      padding: 9px 12px;
+      font-size: 13px;
+      font-weight: 600;
+      font-family: inherit;
+      cursor: pointer;
+      transition: background 0.15s ease, opacity 0.15s ease;
+    }
+
+    .btn-scan {
+      background: var(--accent);
+      color: #fff;
+      margin-top: 10px;
+    }
+
+    .btn-scan:hover:not(:disabled) {
+      background: var(--accent-dark);
+    }
+
+    .btn-save {
+      background: var(--primary);
+      color: #fff;
+    }
+
+    .btn-save:hover:not(:disabled) {
+      background: var(--primary-dark);
+    }
+
+    button:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+    }
+
+    .status {
+      display: none;
+      margin-top: 10px;
+      padding: 8px 10px;
+      border-radius: 6px;
+      font-size: 12px;
+      line-height: 1.4;
+    }
+
+    .status.visible {
+      display: block;
+    }
+
+    .status-info {
+      background: var(--primary-light);
+      color: var(--primary-dark);
+    }
+
+    .status-success {
+      background: var(--success-bg);
+      color: var(--success-text);
+    }
+
+    .status-error {
+      background: var(--error-bg);
+      color: var(--error-text);
+    }
+
+    .spinner {
+      display: inline-block;
+      width: 10px;
+      height: 10px;
+      border: 2px solid rgba(255, 255, 255, 0.5);
+      border-top-color: #fff;
+      border-radius: 50%;
+      animation: spin 0.6s linear infinite;
+      margin-right: 6px;
+      vertical-align: middle;
+    }
+
+    @keyframes spin {
+      to {
+        transform: rotate(360deg);
+      }
+    }
+
+    /* Extracted-results table */
+
+    .table-wrap {
+      overflow-x: auto;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+    }
+
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      min-width: 720px;
+      font-size: 11.5px;
+    }
+
+    thead th {
+      position: sticky;
+      top: 0;
+      background: var(--primary-light);
+      color: var(--primary-dark);
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+      font-size: 10px;
+      font-weight: 600;
+      text-align: left;
+      padding: 6px 8px;
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+    }
+
+    tbody td {
+      padding: 6px 8px;
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+      color: var(--text);
+    }
+
+    tbody tr:last-child td {
+      border-bottom: none;
+    }
+
+    tbody td[contenteditable="true"]:focus {
+      outline: none;
+      background: var(--primary-light);
+      box-shadow: inset 0 0 0 1px var(--accent);
+    }
+
+    td.remove-cell {
+      padding: 4px 6px;
+      text-align: center;
+    }
+
+    .remove-row {
+      width: auto;
+      padding: 0 6px;
+      line-height: 18px;
+      height: 18px;
+      font-size: 13px;
+      font-weight: 400;
+      background: transparent;
+      color: var(--text-muted);
+      border-radius: 4px;
+    }
+
+    .remove-row:hover {
+      background: var(--error-bg);
+      color: var(--error-text);
+    }
+
+    .empty-state {
+      padding: 14px 4px;
+      text-align: center;
+      color: var(--text-muted);
+      font-size: 11.5px;
+    }
+
+    .results-footer {
+      margin-top: 8px;
+      font-size: 11px;
+      color: var(--text-muted);
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <svg width="26" height="26" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <circle cx="12" cy="12" r="11" fill="rgba(255,255,255,0.15)"/>
+      <path d="M12 6v12M6 12h12" stroke="#fff" stroke-width="2.5" stroke-linecap="round"/>
+    </svg>
+    <h1>The Flores Automated PT, Created by Eric R. Flores</h1>
+  </div>
+
+  <div class="container">
+
+    <div class="card">
+      <h2><span class="step-badge">1</span>EOB Scanner</h2>
+      <p class="hint">Upload a screenshot of the EOB / remittance advice and let Gemini pull out every payment line.</p>
+
+      <input type="file" id="fileInput" accept="image/*">
+
+      <img id="imagePreview" class="preview-img" alt="Selected EOB screenshot preview">
+
+      <button type="button" id="scanBtn" class="btn-scan">Scan EOB</button>
+
+      <div id="scanStatus" class="status"></div>
+    </div>
+
+    <div class="card">
+      <h2><span class="step-badge">2</span>Extracted Payments</h2>
+      <p class="hint">Review each line below — cells are editable — and remove any row that shouldn't be posted.</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Patient Name</th>
+              <th>Service Date</th>
+              <th>Insurance</th>
+              <th>Paid Date</th>
+              <th>Check No.</th>
+              <th>Reason</th>
+              <th>Amount</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody id="resultsBody"></tbody>
+        </table>
+      </div>
+      <div id="emptyState" class="empty-state">No payments scanned yet.</div>
+    </div>
+
+    <div class="card">
+      <h2><span class="step-badge">3</span>Reconciliation</h2>
+      <p class="hint">Matches each payment to its visit row by patient name and service date, and fills in Paid Date, Reason, Check No., and Amount there.</p>
+
+      <button type="button" id="reconcileBtn" class="btn-save" disabled>Reconcile to Sheet</button>
+
+      <div id="reconcileStatus" class="status"></div>
+    </div>
+
+  </div>
+
+  <script>
+    var FIELDS = ['patientName', 'serviceDate', 'insurance', 'paidDate', 'checkNo', 'reasonCode', 'amountPaid'];
+
+    var fileInput = document.getElementById('fileInput');
+    var imagePreview = document.getElementById('imagePreview');
+    var scanBtn = document.getElementById('scanBtn');
+    var reconcileBtn = document.getElementById('reconcileBtn');
+    var scanStatus = document.getElementById('scanStatus');
+    var reconcileStatus = document.getElementById('reconcileStatus');
+    var resultsBody = document.getElementById('resultsBody');
+    var emptyState = document.getElementById('emptyState');
+
+    fileInput.addEventListener('change', function () {
+      var file = fileInput.files[0];
+      hideStatus(scanStatus);
+
+      if (!file) {
+        imagePreview.className = 'preview-img';
+        imagePreview.src = '';
+        return;
+      }
+
+      var reader = new FileReader();
+      reader.onload = function (e) {
+        imagePreview.src = e.target.result;
+        imagePreview.className = 'preview-img visible';
+        imagePreview.style.display = 'block';
+      };
+      reader.readAsDataURL(file);
+    });
+
+    scanBtn.addEventListener('click', function () {
+      var file = fileInput.files[0];
+      if (!file) {
+        showStatus(scanStatus, 'Please choose an image file first.', 'error');
+        return;
+      }
+
+      var reader = new FileReader();
+      reader.onload = function (e) {
+        setBusy(true, 'scan');
+        showStatus(scanStatus, 'Scanning EOB with Gemini...', 'info');
+
+        google.script.run
+          .withSuccessHandler(onScanSuccess)
+          .withFailureHandler(onScanFailure)
+          .processEOBImage(e.target.result);
+      };
+      reader.onerror = function () {
+        showStatus(scanStatus, 'Could not read the selected file.', 'error');
+      };
+      reader.readAsDataURL(file);
+    });
+
+    function onScanSuccess(result) {
+      setBusy(false, 'scan');
+
+      if (result && result.success) {
+        renderRows(result.data || []);
+        var count = (result.data || []).length;
+        if (count > 0) {
+          showStatus(scanStatus, 'Extracted ' + count + ' payment line' + (count === 1 ? '' : 's') + '. Review below before reconciling.', 'success');
+        } else {
+          showStatus(scanStatus, 'No payment lines were found in that image.', 'error');
+        }
+      } else {
+        var message = (result && result.error) ? result.error : 'Unknown error while scanning.';
+        showStatus(scanStatus, 'Scan failed: ' + message, 'error');
+      }
+    }
+
+    function onScanFailure(error) {
+      setBusy(false, 'scan');
+      showStatus(scanStatus, 'Scan failed: ' + (error && error.message ? error.message : error), 'error');
+    }
+
+    reconcileBtn.addEventListener('click', function () {
+      var rows = collectRows().filter(function (row) {
+        return row.patientName;
+      });
+
+      if (rows.length === 0) {
+        showStatus(reconcileStatus, 'No rows with a patient name to reconcile.', 'error');
+        return;
+      }
+
+      setBusy(true, 'reconcile');
+      showStatus(reconcileStatus, 'Reconciling ' + rows.length + ' payment' + (rows.length === 1 ? '' : 's') + ' to the sheet...', 'info');
+
+      google.script.run
+        .withSuccessHandler(onReconcileSuccess)
+        .withFailureHandler(onReconcileFailure)
+        .reconcilePayments(rows);
+    });
+
+    function onReconcileSuccess(result) {
+      setBusy(false, 'reconcile');
+
+      if (result && result.success) {
+        var parts = [];
+        if (result.updatedCount > 0) {
+          parts.push('filled in ' + result.updatedCount + ' existing row' + (result.updatedCount === 1 ? '' : 's'));
+        }
+        if (result.insertedCount > 0) {
+          parts.push('added ' + result.insertedCount + ' new row' + (result.insertedCount === 1 ? '' : 's'));
+        }
+        var msg = parts.length ? (parts.join(' and ') + '.') : 'Nothing new to reconcile.';
+        var type = 'success';
+
+        if (result.duplicateCount > 0) {
+          msg += ' ' + result.duplicateCount + ' already recorded and skipped.';
+          type = 'info';
+        }
+        if (result.unresolvedCount > 0) {
+          msg += ' ' + result.unresolvedCount + ' had no matching date section, so ' + (result.unresolvedCount === 1 ? 'it was' : 'they were') + ' added at the bottom for manual placement: ' + result.unresolved.join('; ') + '.';
+          type = 'info';
+        }
+
+        showStatus(reconcileStatus, msg, type);
+      } else {
+        var message = (result && result.error) ? result.error : 'Unknown error while reconciling.';
+        showStatus(reconcileStatus, 'Reconcile failed: ' + message, 'error');
+      }
+    }
+
+    function onReconcileFailure(error) {
+      setBusy(false, 'reconcile');
+      showStatus(reconcileStatus, 'Reconcile failed: ' + (error && error.message ? error.message : error), 'error');
+    }
+
+    function renderRows(rows) {
+      resultsBody.innerHTML = '';
+
+      rows.forEach(function (row) {
+        var tr = document.createElement('tr');
+
+        FIELDS.forEach(function (field) {
+          var td = document.createElement('td');
+          td.contentEditable = 'true';
+          td.dataset.field = field;
+          td.textContent = row[field] || '';
+          tr.appendChild(td);
+        });
+
+        var removeTd = document.createElement('td');
+        removeTd.className = 'remove-cell';
+        var removeBtn = document.createElement('button');
+        removeBtn.type = 'button';
+        removeBtn.className = 'remove-row';
+        removeBtn.textContent = '×';
+        removeBtn.title = 'Remove this row';
+        removeBtn.addEventListener('click', function () {
+          tr.remove();
+          refreshEmptyState();
+        });
+        removeTd.appendChild(removeBtn);
+        tr.appendChild(removeTd);
+
+        resultsBody.appendChild(tr);
+      });
+
+      refreshEmptyState();
+    }
+
+    function collectRows() {
+      var rows = [];
+      Array.prototype.forEach.call(resultsBody.querySelectorAll('tr'), function (tr) {
+        var row = {};
+        Array.prototype.forEach.call(tr.querySelectorAll('td[data-field]'), function (td) {
+          row[td.dataset.field] = td.textContent.trim();
+        });
+        rows.push(row);
+      });
+      return rows;
+    }
+
+    function refreshEmptyState() {
+      var hasRows = resultsBody.children.length > 0;
+      emptyState.style.display = hasRows ? 'none' : 'block';
+      reconcileBtn.disabled = !hasRows;
+    }
+
+    function setBusy(isBusy, which) {
+      scanBtn.disabled = isBusy;
+      reconcileBtn.disabled = isBusy ? true : resultsBody.children.length === 0;
+
+      if (which === 'scan') {
+        scanBtn.innerHTML = isBusy ? '<span class="spinner"></span>Scanning...' : 'Scan EOB';
+      } else if (which === 'reconcile') {
+        reconcileBtn.innerHTML = isBusy ? '<span class="spinner"></span>Reconciling...' : 'Reconcile to Sheet';
+      }
+    }
+
+    function showStatus(el, message, type) {
+      el.textContent = message;
+      el.className = 'status visible status-' + type;
+    }
+
+    function hideStatus(el) {
+      el.className = 'status';
+      el.textContent = '';
+    }
+
+    refreshEmptyState();
+  </script>
+</body>
+</html>
