@@ -6,6 +6,12 @@
 var GEMINI_MODEL = 'gemini-3.1-flash-lite';
 var GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/' + GEMINI_MODEL + ':generateContent';
 
+/** Gemini reply codes that mean it is busy or briefly unavailable, so the request is worth sending again. */
+var GEMINI_RETRY_CODES = [429, 500, 502, 503, 504];
+
+/** Seconds to wait before each new try while Gemini is busy: up to 4 tries over about 17 seconds. */
+var GEMINI_RETRY_WAIT_SECONDS = [2, 5, 10];
+
 /**
  * Adds "The Flores Automated PT Helper" menu when the spreadsheet opens.
  */
@@ -224,11 +230,42 @@ function appendData(patientData) {
  * ------------------------------------------------------------------- */
 
 /**
+ * Sends a request to Gemini. While Gemini answers that it is busy or briefly
+ * unavailable (GEMINI_RETRY_CODES), waits and sends the same request again,
+ * once for each entry in GEMINI_RETRY_WAIT_SECONDS. Returns the last
+ * response, so a reply that is still busy after the last try is reported
+ * the same way as before.
+ *
+ * @param {string} url Gemini endpoint, including the API key.
+ * @param {Object} options UrlFetchApp options; muteHttpExceptions must be true.
+ * @return {HTTPResponse} The last response from Gemini.
+ */
+function fetchGeminiWithRetry_(url, options) {
+  var response = UrlFetchApp.fetch(url, options);
+  for (var retry = 0; retry < GEMINI_RETRY_WAIT_SECONDS.length; retry++) {
+    var responseCode = response.getResponseCode();
+    if (GEMINI_RETRY_CODES.indexOf(responseCode) === -1) {
+      break;
+    }
+    console.log('Gemini is busy (' + responseCode + '); try ' + (retry + 2) + ' of ' +
+      (GEMINI_RETRY_WAIT_SECONDS.length + 1) + ' in ' + GEMINI_RETRY_WAIT_SECONDS[retry] + ' s.');
+    Utilities.sleep(GEMINI_RETRY_WAIT_SECONDS[retry] * 1000);
+    response = UrlFetchApp.fetch(url, options);
+  }
+  return response;
+}
+
+/**
  * Sends a screenshot or PDF of an EOB / remittance advice to Gemini and
  * returns the extracted payment line items as an array. base64Data may be a
  * raw base64 string or a full "data:<mime>;base64,...." URL — the data:
  * prefix is stripped here before the file is sent to the Gemini API. A PDF
  * may have several pages; Gemini is asked to pull claims from all of them.
+ * It also reads a screenshot of an Inovalon Claim Management Pro claims
+ * list. That list has no check number or payment date (and its Import Date
+ * is not the payment date), so those come back blank and get filled in from
+ * the sidebar instead. If Gemini is busy, the request is sent again a few
+ * times before the scan fails (see fetchGeminiWithRetry_).
  *
  * @param {string} base64Data Image or PDF data captured from the file input.
  * @return {{success: boolean, data?: Object[], error?: string}}
@@ -258,6 +295,15 @@ function processEOBImage(base64Data) {
       'with its own PREV PD / INTEREST / NET figures — CLAIM TOTALS and NET are two different numbers and must not ' +
       'be confused for each other. A single Date and Check/EFT number are also shown once near the top of each ' +
       'page. The payer name, Date, and Check/EFT number apply to every claim on the same page as them.\n\n' +
+      'The image may instead be a claims list from Inovalon Claim Management Pro: a table with one row per claim ' +
+      'and column headers such as Import Date, Patient Ctl No, Patient Name, Claim Charge, Claim Payment, Statement ' +
+      'Start, Statement End and Payer Name. For that kind of table, return one object per table row and fill the ' +
+      'keys below this way instead: patientName from the Patient Name column; serviceDate from the Statement Start ' +
+      'column; insurance from that row\'s Payer Name column; amountPaid from the Claim Payment column (never Claim ' +
+      'Charge); reasonCode only if the row shows an adjustment/reason code, otherwise an empty string; and paidDate ' +
+      'and checkNo only if the table shows a payment/check date or a check/EFT number for that row, otherwise empty ' +
+      'strings. The Import Date is when the remittance was loaded into Inovalon, not when the claim was paid, so ' +
+      'never use it for paidDate or for anything else.\n\n' +
       'Return ONLY a raw JSON array of objects (no markdown formatting, no backticks, no surrounding text), with ' +
       'ONE object per claim — that is, per patient per service date. If the same patient name appears in two ' +
       'separate claim blocks with different service dates, treat them as two separate objects; if one claim has ' +
@@ -303,7 +349,7 @@ function processEOBImage(base64Data) {
       muteHttpExceptions: true
     };
 
-    var response = UrlFetchApp.fetch(GEMINI_API_URL + '?key=' + apiKey, options);
+    var response = fetchGeminiWithRetry_(GEMINI_API_URL + '?key=' + apiKey, options);
     var responseCode = response.getResponseCode();
     var responseBody = response.getContentText();
 
@@ -371,12 +417,12 @@ function normalizeEOBRow_(rawRow) {
 
   return {
     patientName: pick('Patient Name', 'PatientName', 'patient_name', 'name'),
-    serviceDate: pick('Service Date', 'ServiceDate', 'service_date', 'Date of Service', 'DOS'),
-    insurance: pick('Insurance', 'Insurance Company', 'Payer', 'insurance_company'),
+    serviceDate: pick('Service Date', 'ServiceDate', 'service_date', 'Date of Service', 'DOS', 'Statement Start'),
+    insurance: pick('Insurance', 'Insurance Company', 'Payer', 'insurance_company', 'Payer Name'),
     paidDate: pick('Paid Date', 'PaidDate', 'paid_date', 'Date/Check EFT Date', 'Check EFT Date', 'Check Date'),
     checkNo: String(pick('Check No.', 'Check No', 'CheckNo', 'check_no', 'Check/EFT Number', 'Check EFT Number') || '').trim(),
     reasonCode: pick('Reason Code', 'ReasonCode', 'reason_code', 'Reason'),
-    amountPaid: pick('Amount Paid', 'AmountPaid', 'amount_paid', 'PROV PD', 'Amount')
+    amountPaid: pick('Amount Paid', 'AmountPaid', 'amount_paid', 'PROV PD', 'Amount', 'Claim Payment')
   };
 }
 

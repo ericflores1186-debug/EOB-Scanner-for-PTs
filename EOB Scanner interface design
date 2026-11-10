@@ -346,6 +346,66 @@
       margin-top: 0;
       margin-bottom: 10px;
     }
+
+    /* Check No. / Paid Date fill box (for Inovalon lists, which don't show them) */
+
+    .fill-box {
+      display: none;
+      margin-top: 10px;
+      padding: 10px;
+      border: 1px dashed var(--border);
+      border-radius: 8px;
+      background: var(--bg);
+    }
+
+    .fill-box.visible {
+      display: block;
+    }
+
+    .missing-note {
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--error-text);
+      margin-bottom: 6px;
+    }
+
+    .fill-box .hint {
+      margin: 0 0 8px;
+    }
+
+    .fill-row {
+      display: flex;
+      gap: 6px;
+      margin-bottom: 8px;
+    }
+
+    .fill-row input {
+      flex: 1;
+      min-width: 0;
+      font-family: inherit;
+      font-size: 13px;
+      padding: 7px 8px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: var(--card-bg);
+      color: var(--text);
+    }
+
+    .fill-row input:focus {
+      outline: none;
+      border-color: var(--accent);
+      box-shadow: 0 0 0 2px var(--primary-light);
+    }
+
+    .btn-fill {
+      background: var(--card-bg);
+      color: var(--primary);
+      border: 1px solid var(--primary);
+    }
+
+    .btn-fill:hover:not(:disabled) {
+      background: var(--primary-light);
+    }
   </style>
 </head>
 <body>
@@ -395,6 +455,17 @@
         </table>
       </div>
       <div id="emptyState" class="empty-state">No payments scanned yet.</div>
+
+      <div id="fillBox" class="fill-box">
+        <div id="missingNote" class="missing-note"></div>
+        <p class="hint">Inovalon lists don't show these. Open one patient from this batch in Inovalon, type its check number and payment date here, and click Fill. Only empty cells are filled, so use it when every row is from the same check.</p>
+        <div class="fill-row">
+          <input type="text" id="fillCheckNo" placeholder="Check No." autocomplete="off" aria-label="Check No. for every row">
+          <input type="text" id="fillPaidDate" placeholder="Paid Date" autocomplete="off" aria-label="Paid Date for every row">
+        </div>
+        <button type="button" id="fillBtn" class="btn-fill">Fill empty Check No. / Paid Date</button>
+        <div id="fillStatus" class="status"></div>
+      </div>
     </div>
 
     <div class="card">
@@ -435,6 +506,17 @@
 
     var busy = false;        // a scan or reconcile is running
     var loadingTabs = false; // the tab list is being fetched
+
+    var fillBox = document.getElementById('fillBox');
+    var missingNote = document.getElementById('missingNote');
+    var fillCheckNo = document.getElementById('fillCheckNo');
+    var fillPaidDate = document.getElementById('fillPaidDate');
+    var fillBtn = document.getElementById('fillBtn');
+    var fillStatus = document.getElementById('fillStatus');
+
+    // set when Reconcile was clicked once despite rows missing a Check No. or Paid Date;
+    // the next click posts them anyway. Any change to the table clears it.
+    var postWithoutConfirmed = false;
 
     fileInput.addEventListener('change', function () {
       var file = fileInput.files[0];
@@ -524,6 +606,15 @@
 
       if (rows.length === 0) {
         showStatus(reconcileStatus, 'No rows with a patient name to reconcile.', 'error');
+        return;
+      }
+
+      // a row posted without these is hard to fix later (the sheet then sees it as already
+      // paid), so ask for a second click before posting it
+      var missing = countMissing();
+      if (missing > 0 && !postWithoutConfirmed) {
+        postWithoutConfirmed = true;
+        showStatus(reconcileStatus, missing + ' row' + (missing === 1 ? ' has' : 's have') + ' no Check No. or Paid Date. Fill them in above, or click Reconcile again to post without them.', 'error');
         return;
       }
 
@@ -620,12 +711,14 @@
     function refreshEmptyState() {
       var hasRows = resultsBody.children.length > 0;
       emptyState.style.display = hasRows ? 'none' : 'block';
+      onTableChanged();
       updateControls();
     }
 
     // one place that decides which controls can be used right now
     function updateControls() {
       scanBtn.disabled = busy;
+      fillBtn.disabled = busy;
       tabSelect.disabled = busy || loadingTabs || !tabSelect.value;
       refreshTabsBtn.disabled = busy || loadingTabs;
       reconcileBtn.disabled = busy || loadingTabs || !tabSelect.value || resultsBody.children.length === 0;
@@ -651,6 +744,48 @@
       el.className = 'status';
       el.textContent = '';
     }
+
+    // ---- Check No. / Paid Date fill box ----
+
+    // rows whose Check No. or Paid Date cell is still empty
+    function countMissing() {
+      var missing = 0;
+      Array.prototype.forEach.call(resultsBody.querySelectorAll('tr'), function (tr) {
+        var checkNo = tr.querySelector('td[data-field="checkNo"]');
+        var paidDate = tr.querySelector('td[data-field="paidDate"]');
+        if (!checkNo.textContent.trim() || !paidDate.textContent.trim()) {
+          missing++;
+        }
+      });
+      return missing;
+    }
+
+    // runs whenever the table changes: rows scanned, a cell edited, filled, or a row removed
+    function onTableChanged() {
+      postWithoutConfirmed = false;
+      var missing = countMissing();
+      fillBox.className = missing > 0 ? 'fill-box visible' : 'fill-box';
+      missingNote.textContent = missing + ' row' + (missing === 1 ? ' has' : 's have') + ' no Check No. or Paid Date.';
+    }
+
+    resultsBody.addEventListener('input', onTableChanged);
+
+    fillBtn.addEventListener('click', function () {
+      var values = { checkNo: fillCheckNo.value.trim(), paidDate: fillPaidDate.value.trim() };
+      if (!values.checkNo && !values.paidDate) {
+        showStatus(fillStatus, 'Type the check number and paid date first.', 'error');
+        return;
+      }
+      hideStatus(fillStatus);
+
+      Array.prototype.forEach.call(resultsBody.querySelectorAll('td[data-field="checkNo"], td[data-field="paidDate"]'), function (td) {
+        var value = values[td.dataset.field];
+        if (value && !td.textContent.trim()) {
+          td.textContent = value;
+        }
+      });
+      onTableChanged();
+    });
 
     // ---- tab picker ----
 
