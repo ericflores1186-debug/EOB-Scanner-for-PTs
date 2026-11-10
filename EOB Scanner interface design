@@ -112,6 +112,23 @@
       border: 1px solid var(--border);
     }
 
+    .file-preview {
+      display: none;
+      align-items: center;
+      gap: 8px;
+      margin-top: 10px;
+      padding: 8px 10px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: var(--primary-light);
+      color: var(--primary-dark);
+      font-size: 12.5px;
+    }
+
+    .file-preview.visible {
+      display: flex;
+    }
+
     button {
       width: 100%;
       border: none;
@@ -275,6 +292,60 @@
       font-size: 11px;
       color: var(--text-muted);
     }
+
+    /* Tab picker */
+
+    .field-label {
+      display: block;
+      font-size: 11.5px;
+      font-weight: 600;
+      color: var(--text);
+      margin-bottom: 4px;
+    }
+
+    .tab-row {
+      display: flex;
+      gap: 6px;
+      margin-bottom: 10px;
+    }
+
+    .tab-row select {
+      flex: 1;
+      min-width: 0;
+      font-family: inherit;
+      font-size: 13px;
+      padding: 7px 8px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: var(--card-bg);
+      color: var(--text);
+    }
+
+    .tab-row select:focus {
+      outline: none;
+      border-color: var(--accent);
+      box-shadow: 0 0 0 2px var(--primary-light);
+    }
+
+    .btn-refresh {
+      width: auto;
+      flex-shrink: 0;
+      padding: 0 11px;
+      background: var(--card-bg);
+      color: var(--primary);
+      border: 1px solid var(--border);
+      font-size: 15px;
+      font-weight: 400;
+    }
+
+    .btn-refresh:hover:not(:disabled) {
+      background: var(--primary-light);
+    }
+
+    #tabStatus {
+      margin-top: 0;
+      margin-bottom: 10px;
+    }
   </style>
 </head>
 <body>
@@ -290,11 +361,12 @@
 
     <div class="card">
       <h2><span class="step-badge">1</span>EOB Scanner</h2>
-      <p class="hint">Upload a screenshot of the EOB / remittance advice and let Gemini pull out every payment line.</p>
+      <p class="hint">Upload a screenshot or PDF of the EOB / remittance advice and let Gemini pull out every payment line.</p>
 
-      <input type="file" id="fileInput" accept="image/*">
+      <input type="file" id="fileInput" accept="image/*,application/pdf,.pdf">
 
-      <img id="imagePreview" class="preview-img" alt="Selected EOB screenshot preview">
+      <img id="imagePreview" class="preview-img" alt="Selected EOB preview">
+      <div id="filePreview" class="file-preview"></div>
 
       <button type="button" id="scanBtn" class="btn-scan">Scan EOB</button>
 
@@ -327,7 +399,16 @@
 
     <div class="card">
       <h2><span class="step-badge">3</span>Reconciliation</h2>
-      <p class="hint">Matches each payment to its visit row by patient name and service date, and fills in Paid Date, Reason, Check No., and Amount there.</p>
+      <p class="hint">Matches each payment to its visit row on the tab you pick, by patient name and service date, and fills in Paid Date, Reason, Check No., and Amount there.</p>
+
+      <label class="field-label" for="tabSelect">Post to tab</label>
+      <div class="tab-row">
+        <select id="tabSelect" disabled>
+          <option value="">Loading tabs…</option>
+        </select>
+        <button type="button" id="refreshTabsBtn" class="btn-refresh" title="Reload the tab list" aria-label="Reload the tab list" disabled>↻</button>
+      </div>
+      <div id="tabStatus" class="status"></div>
 
       <button type="button" id="reconcileBtn" class="btn-save" disabled>Reconcile to Sheet</button>
 
@@ -341,20 +422,38 @@
 
     var fileInput = document.getElementById('fileInput');
     var imagePreview = document.getElementById('imagePreview');
+    var filePreview = document.getElementById('filePreview');
     var scanBtn = document.getElementById('scanBtn');
     var reconcileBtn = document.getElementById('reconcileBtn');
     var scanStatus = document.getElementById('scanStatus');
     var reconcileStatus = document.getElementById('reconcileStatus');
     var resultsBody = document.getElementById('resultsBody');
     var emptyState = document.getElementById('emptyState');
+    var tabSelect = document.getElementById('tabSelect');
+    var refreshTabsBtn = document.getElementById('refreshTabsBtn');
+    var tabStatus = document.getElementById('tabStatus');
+
+    var busy = false;        // a scan or reconcile is running
+    var loadingTabs = false; // the tab list is being fetched
 
     fileInput.addEventListener('change', function () {
       var file = fileInput.files[0];
       hideStatus(scanStatus);
+      imagePreview.className = 'preview-img';
+      imagePreview.src = '';
+      filePreview.className = 'file-preview';
+      filePreview.textContent = '';
 
       if (!file) {
-        imagePreview.className = 'preview-img';
-        imagePreview.src = '';
+        return;
+      }
+
+      var isPdf = file.type === 'application/pdf' || /\.pdf$/i.test(file.name);
+
+      if (isPdf) {
+        filePreview.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" style="flex-shrink:0"><path d="M6 2h9l5 5v15a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V3a1 1 0 0 1 1-1z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M15 2v5h5" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg><span></span>';
+        filePreview.querySelector('span').textContent = file.name;
+        filePreview.className = 'file-preview visible';
         return;
       }
 
@@ -370,7 +469,7 @@
     scanBtn.addEventListener('click', function () {
       var file = fileInput.files[0];
       if (!file) {
-        showStatus(scanStatus, 'Please choose an image file first.', 'error');
+        showStatus(scanStatus, 'Please choose a screenshot or PDF first.', 'error');
         return;
       }
 
@@ -399,7 +498,7 @@
         if (count > 0) {
           showStatus(scanStatus, 'Extracted ' + count + ' payment line' + (count === 1 ? '' : 's') + '. Review below before reconciling.', 'success');
         } else {
-          showStatus(scanStatus, 'No payment lines were found in that image.', 'error');
+          showStatus(scanStatus, 'No payment lines were found in that file.', 'error');
         }
       } else {
         var message = (result && result.error) ? result.error : 'Unknown error while scanning.';
@@ -413,6 +512,12 @@
     }
 
     reconcileBtn.addEventListener('click', function () {
+      var tabName = tabSelect.value;
+      if (!tabName) {
+        showStatus(reconcileStatus, 'Pick the tab to post these payments to first.', 'error');
+        return;
+      }
+
       var rows = collectRows().filter(function (row) {
         return row.patientName;
       });
@@ -423,34 +528,34 @@
       }
 
       setBusy(true, 'reconcile');
-      showStatus(reconcileStatus, 'Reconciling ' + rows.length + ' payment' + (rows.length === 1 ? '' : 's') + ' to the sheet...', 'info');
+      showStatus(reconcileStatus, 'Reconciling ' + rows.length + ' payment' + (rows.length === 1 ? '' : 's') + ' to "' + tabName + '"...', 'info');
 
       google.script.run
         .withSuccessHandler(onReconcileSuccess)
         .withFailureHandler(onReconcileFailure)
-        .reconcilePayments(rows);
+        .reconcilePayments(rows, tabName);
     });
 
     function onReconcileSuccess(result) {
       setBusy(false, 'reconcile');
 
       if (result && result.success) {
-        var parts = [];
-        if (result.updatedCount > 0) {
-          parts.push('filled in ' + result.updatedCount + ' existing row' + (result.updatedCount === 1 ? '' : 's'));
-        }
-        if (result.insertedCount > 0) {
-          parts.push('added ' + result.insertedCount + ' new row' + (result.insertedCount === 1 ? '' : 's'));
-        }
-        var msg = parts.length ? (parts.join(' and ') + '.') : 'Nothing new to reconcile.';
+        var onTab = result.sheetName ? ' on "' + result.sheetName + '"' : '';
+        var msg = result.updatedCount > 0
+          ? 'Filled in ' + result.updatedCount + ' existing row' + (result.updatedCount === 1 ? '' : 's') + onTab + '.'
+          : 'Nothing to fill in' + onTab + ' — no genuinely blank matching rows were found.';
         var type = 'success';
 
         if (result.duplicateCount > 0) {
           msg += ' ' + result.duplicateCount + ' already recorded and skipped.';
           type = 'info';
         }
+        if (result.conflictCount > 0) {
+          msg += ' ' + result.conflictCount + ' already had different data recorded, left unchanged: ' + result.conflicts.join('; ') + '.';
+          type = 'info';
+        }
         if (result.unresolvedCount > 0) {
-          msg += ' ' + result.unresolvedCount + ' had no matching date section, so ' + (result.unresolvedCount === 1 ? 'it was' : 'they were') + ' added at the bottom for manual placement: ' + result.unresolved.join('; ') + '.';
+          msg += ' ' + result.unresolvedCount + ' had no matching row: ' + result.unresolved.join('; ') + '.';
           type = 'info';
         }
 
@@ -515,12 +620,20 @@
     function refreshEmptyState() {
       var hasRows = resultsBody.children.length > 0;
       emptyState.style.display = hasRows ? 'none' : 'block';
-      reconcileBtn.disabled = !hasRows;
+      updateControls();
+    }
+
+    // one place that decides which controls can be used right now
+    function updateControls() {
+      scanBtn.disabled = busy;
+      tabSelect.disabled = busy || loadingTabs || !tabSelect.value;
+      refreshTabsBtn.disabled = busy || loadingTabs;
+      reconcileBtn.disabled = busy || loadingTabs || !tabSelect.value || resultsBody.children.length === 0;
     }
 
     function setBusy(isBusy, which) {
-      scanBtn.disabled = isBusy;
-      reconcileBtn.disabled = isBusy ? true : resultsBody.children.length === 0;
+      busy = isBusy;
+      updateControls();
 
       if (which === 'scan') {
         scanBtn.innerHTML = isBusy ? '<span class="spinner"></span>Scanning...' : 'Scan EOB';
@@ -539,7 +652,67 @@
       el.textContent = '';
     }
 
+    // ---- tab picker ----
+
+    refreshTabsBtn.addEventListener('click', loadTabs);
+
+    // Asks the script for the attendance tabs and fills the dropdown. Keeps the tab that was
+    // already picked if it's still there, otherwise starts on the tab that's open in the sheet.
+    function loadTabs() {
+      var keep = tabSelect.value;
+      loadingTabs = true;
+      setTabOptions([{ value: '', label: 'Loading tabs…' }], '');
+      hideStatus(tabStatus);
+      updateControls();
+
+      google.script.run
+        .withSuccessHandler(function (result) {
+          onTabsLoaded(result, keep);
+        })
+        .withFailureHandler(function (error) {
+          onTabsLoaded({ success: false, error: error && error.message ? error.message : String(error) }, keep);
+        })
+        .getLedgerTabs();
+    }
+
+    function onTabsLoaded(result, keep) {
+      loadingTabs = false;
+      var tabs = (result && result.success && result.tabs) || [];
+
+      if (!result || !result.success) {
+        setTabOptions([{ value: '', label: 'Could not load tabs' }], '');
+        showStatus(tabStatus, 'Could not load the tab list: ' + ((result && result.error) || 'unknown error') + '. Click ↻ to try again.', 'error');
+      } else if (!tabs.length) {
+        setTabOptions([{ value: '', label: 'No attendance tabs found' }], '');
+        showStatus(tabStatus, 'No tab has Paid Date, Reason, Check No. and Amount headings in its first rows, so there is nowhere to post payments yet.', 'error');
+      } else {
+        var names = tabs.map(function (t) {
+          return t.name;
+        });
+        var pick = names.indexOf(keep) !== -1 ? keep
+          : names.indexOf(result.active) !== -1 ? result.active
+          : names[0];
+        setTabOptions(tabs.map(function (t) {
+          return { value: t.name, label: t.name + (t.hidden ? ' (hidden)' : '') };
+        }), pick);
+      }
+
+      updateControls();
+    }
+
+    function setTabOptions(options, selected) {
+      tabSelect.innerHTML = '';
+      options.forEach(function (o) {
+        var opt = document.createElement('option');
+        opt.value = o.value;
+        opt.textContent = o.label;
+        tabSelect.appendChild(opt);
+      });
+      tabSelect.value = selected;
+    }
+
     refreshEmptyState();
+    loadTabs();
   </script>
 </body>
 </html>

@@ -1,16 +1,14 @@
-// The Flores Automated PT
-// Created by Eric R. Flores
-//
-// Two sidebars live in this project:
-//   Scanner          - reads an insurance authorization screenshot/PDF and adds it to the sheet
-//   Flush Attendance - reads an EOB and fills in the payment columns on the attendance tabs
-// Gemini does the reading for both.
+/**
+ * The Flores Automated PT — AI-powered authorization intake.
+ * Created by Eric R. Flores.
+ */
 
-// model names get retired every so often. If scans start failing with a 404 about the model,
-// check which ones your key can use: https://generativelanguage.googleapis.com/v1beta/models?key=YOUR_KEY
 var GEMINI_MODEL = 'gemini-3.1-flash-lite';
 var GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/' + GEMINI_MODEL + ':generateContent';
 
+/**
+ * Adds "The Flores Automated PT Helper" menu when the spreadsheet opens.
+ */
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('The Flores Automated PT Helper')
@@ -19,6 +17,9 @@ function onOpen() {
     .addToUi();
 }
 
+/**
+ * Serves Sidebar.html in the Google Sheets sidebar.
+ */
 function showSidebar() {
   var html = HtmlService.createHtmlOutputFromFile('Sidebar')
     .setTitle('Automated PT Scanner')
@@ -26,6 +27,9 @@ function showSidebar() {
   SpreadsheetApp.getUi().showSidebar(html);
 }
 
+/**
+ * Serves FlushSidebar.html in the Google Sheets sidebar.
+ */
 function showFlushSidebar() {
   var html = HtmlService.createHtmlOutputFromFile('FlushSidebar')
     .setTitle('Flush Attendance Auto-Biller')
@@ -33,120 +37,158 @@ function showFlushSidebar() {
   SpreadsheetApp.getUi().showSidebar(html);
 }
 
-// Both scanners go through this. base64Data is the data: URL the sidebar builds with
-// FileReader, so it can be a png/jpg or a pdf. Gives back the parsed JSON from Gemini.
-function callGemini_(prompt, base64Data) {
-  if (!base64Data) {
-    throw new Error('No image data was received.');
+/**
+ * Splits a "data:<mime>;base64,<data>" URL into its MIME type and raw
+ * base64 payload, defaulting to image/png when base64Data has no such
+ * prefix (a bare base64 string). Any MIME type is accepted here — the
+ * sidebar's file input takes both images and PDFs, and Gemini's
+ * generateContent endpoint accepts a PDF the same way as an image, via
+ * inline_data with mime_type "application/pdf".
+ */
+function parseDataUrl_(base64Data) {
+  var mimeMatch = base64Data.match(/^data:([a-zA-Z0-9.+-]+\/[a-zA-Z0-9.+-]+);base64,/);
+  return {
+    mimeType: mimeMatch ? mimeMatch[1] : 'image/png',
+    data: base64Data.replace(/^data:[a-zA-Z0-9.+-]+\/[a-zA-Z0-9.+-]+;base64,/, '')
+  };
+}
+
+/**
+ * Sends a screenshot or PDF to Gemini and returns extracted authorization
+ * fields as JSON. base64Data may be a raw base64 string or a full
+ * "data:<mime>;base64,...." URL — the data: prefix is stripped here before
+ * the file is sent to the Gemini API.
+ *
+ * @param {string} base64Data Image or PDF data captured from the file input.
+ * @return {{success: boolean, data?: Object, error?: string}}
+ */
+function processImage(base64Data) {
+  try {
+    if (!base64Data) {
+      throw new Error('No image data was received.');
+    }
+
+    var apiKey = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
+    if (!apiKey) {
+      throw new Error('Gemini API key is not configured. In the Apps Script editor, open Project Settings > Script Properties and add a GEMINI_API_KEY property.');
+    }
+
+    var parsedFile = parseDataUrl_(base64Data);
+    var mimeType = parsedFile.mimeType;
+    var cleanBase64 = parsedFile.data;
+
+    var prompt = 'Analyze this insurance authorization document (a screenshot or a PDF). Extract the Patient Name, Member ID, Auth Number, Approved Visits, Start Date, and End Date. Return ONLY a valid, raw JSON object with these keys (no markdown formatting, no backticks).';
+
+    var payload = {
+      contents: [
+        {
+          parts: [
+            { text: prompt },
+            {
+              inline_data: {
+                mime_type: mimeType,
+                data: cleanBase64
+              }
+            }
+          ]
+        }
+      ],
+      generationConfig: {
+        temperature: 0.1
+      }
+    };
+
+    var options = {
+      method: 'post',
+      contentType: 'application/json',
+      payload: JSON.stringify(payload),
+      muteHttpExceptions: true
+    };
+
+    var response = UrlFetchApp.fetch(GEMINI_API_URL + '?key=' + apiKey, options);
+    var responseCode = response.getResponseCode();
+    var responseBody = response.getContentText();
+
+    if (responseCode !== 200) {
+      var apiErrorMessage = responseBody;
+      try {
+        var errorJson = JSON.parse(responseBody);
+        if (errorJson.error && errorJson.error.message) {
+          apiErrorMessage = errorJson.error.message;
+        }
+      } catch (parseErrorIgnored) {
+        // Error body wasn't JSON — fall back to the raw response text.
+      }
+      throw new Error('Gemini API error (' + responseCode + '): ' + apiErrorMessage);
+    }
+
+    var responseData = JSON.parse(responseBody);
+    var candidate = responseData.candidates && responseData.candidates[0];
+    var textPart = candidate && candidate.content && candidate.content.parts && candidate.content.parts[0];
+
+    if (!textPart || !textPart.text) {
+      throw new Error('Gemini did not return any readable text. The image may be unclear, unreadable, or blocked by safety filters.');
+    }
+
+    var cleanedText = textPart.text.replace(/```json/gi, '').replace(/```/g, '').trim();
+
+    var parsed;
+    try {
+      parsed = JSON.parse(cleanedText);
+    } catch (jsonErrorIgnored) {
+      throw new Error('Gemini response was not valid JSON: ' + cleanedText);
+    }
+
+    return { success: true, data: normalizeExtractedData_(parsed) };
+
+  } catch (error) {
+    return { success: false, error: error.message };
   }
+}
 
-  var apiKey = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
-  if (!apiKey) {
-    throw new Error('Gemini API key is not configured. In the Apps Script editor, open Project Settings > Script Properties and add a GEMINI_API_KEY property.');
-  }
-
-  // "data:application/pdf;base64,AAAA..." -> mime type + the raw base64.
-  // No prefix at all? assume it's a png.
-  var dataUrl = /^data:([a-zA-Z0-9.+-]+\/[a-zA-Z0-9.+-]+);base64,/;
-  var found = base64Data.match(dataUrl);
-  var mimeType = found ? found[1] : 'image/png';
-  var rawData = base64Data.replace(dataUrl, '');
-
-  var response = UrlFetchApp.fetch(GEMINI_API_URL + '?key=' + apiKey, {
-    method: 'post',
-    contentType: 'application/json',
-    payload: JSON.stringify({
-      contents: [{
-        parts: [
-          { text: prompt },
-          { inline_data: { mime_type: mimeType, data: rawData } }
-        ]
-      }],
-      generationConfig: { temperature: 0.1 }
-    }),
-    muteHttpExceptions: true
+/**
+ * Maps Gemini's returned object onto a fixed set of camelCase keys
+ * regardless of the exact casing/spacing/underscoring it used, since
+ * LLM JSON output does not reliably repeat key formatting verbatim.
+ */
+function normalizeExtractedData_(rawData) {
+  var normalizedMap = {};
+  Object.keys(rawData || {}).forEach(function (key) {
+    normalizedMap[normalizeKey_(key)] = rawData[key];
   });
 
-  var code = response.getResponseCode();
-  var body = response.getContentText();
-
-  if (code !== 200) {
-    var msg = body;
-    try {
-      var err = JSON.parse(body);
-      if (err.error && err.error.message) {
-        msg = err.error.message;
+  function pick() {
+    for (var i = 0; i < arguments.length; i++) {
+      var value = normalizedMap[normalizeKey_(arguments[i])];
+      if (value !== undefined && value !== null && value !== '') {
+        return value;
       }
-    } catch (e) {
-      // body wasn't json, just show it as is
     }
-    throw new Error('Gemini API error (' + code + '): ' + msg);
+    return '';
   }
 
-  var reply = JSON.parse(body);
-  var candidate = reply.candidates && reply.candidates[0];
-  var part = candidate && candidate.content && candidate.content.parts && candidate.content.parts[0];
-  if (!part || !part.text) {
-    throw new Error('Gemini did not return any readable text. The image may be unclear, unreadable, or blocked by safety filters.');
-  }
-
-  // sometimes it wraps the json in ``` fences even when told not to
-  var text = part.text.replace(/```json/gi, '').replace(/```/g, '').trim();
-  try {
-    return JSON.parse(text);
-  } catch (e) {
-    throw new Error('Gemini response was not valid JSON: ' + text);
-  }
+  return {
+    patientName: pick('Patient Name', 'PatientName', 'patient_name', 'name'),
+    memberId: pick('Member ID', 'MemberID', 'member_id', 'memberId'),
+    authNumber: pick('Auth Number', 'Authorization Number', 'AuthNumber', 'auth_number'),
+    approvedVisits: pick('Approved Visits', 'ApprovedVisits', 'approved_visits', 'visits'),
+    startDate: pick('Start Date', 'StartDate', 'start_date', 'Effective Date'),
+    endDate: pick('End Date', 'EndDate', 'end_date', 'Expiration Date')
+  };
 }
 
 function normalizeKey_(key) {
   return String(key).toLowerCase().replace(/[^a-z0-9]/g, '');
 }
 
-// Gemini doesn't always spell the keys the way I asked ("Patient Name" / "patient_name" /
-// "patientName"), so match on the normalized key instead of the exact one.
-function fieldPicker_(raw) {
-  var byKey = {};
-  Object.keys(raw || {}).forEach(function (k) {
-    byKey[normalizeKey_(k)] = raw[k];
-  });
-
-  // pick('Paid Date', 'Check Date') -> first one that actually has something in it
-  return function () {
-    for (var i = 0; i < arguments.length; i++) {
-      var v = byKey[normalizeKey_(arguments[i])];
-      if (v !== undefined && v !== null && v !== '') return v;
-    }
-    return '';
-  };
-}
-
-
-// ---- authorization scanner ----
-
-function processImage(base64Data) {
-  try {
-    var prompt = 'Analyze this insurance authorization document (a screenshot or a PDF). Extract the Patient Name, Member ID, Auth Number, Approved Visits, Start Date, and End Date. Return ONLY a valid, raw JSON object with these keys (no markdown formatting, no backticks).';
-    var parsed = callGemini_(prompt, base64Data);
-    return { success: true, data: normalizeExtractedData_(parsed) };
-  } catch (e) {
-    return { success: false, error: e.message };
-  }
-}
-
-function normalizeExtractedData_(raw) {
-  var pick = fieldPicker_(raw);
-  return {
-    patientName: pick('Patient Name', 'name'),
-    memberId: pick('Member ID'),
-    authNumber: pick('Auth Number', 'Authorization Number'),
-    approvedVisits: pick('Approved Visits', 'visits'),
-    startDate: pick('Start Date', 'Effective Date'),
-    endDate: pick('End Date', 'Expiration Date')
-  };
-}
-
-// adds a header row first if the sheet is completely empty
+/**
+ * Appends the reviewed form data to the next available row in the active
+ * sheet, writing a bold header row first if the sheet is currently empty.
+ *
+ * @param {{patientName:string, memberId:string, authNumber:string,
+ *          approvedVisits:(string|number), startDate:string, endDate:string}} patientData
+ * @return {{success: boolean, error?: string}}
+ */
 function appendData(patientData) {
   try {
     if (!patientData || !String(patientData.patientName || '').trim()) {
@@ -154,8 +196,9 @@ function appendData(patientData) {
     }
 
     var sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+    var headers = ['Patient Name', 'Member ID', 'Auth Number', 'Approved Visits', 'Start Date', 'End Date'];
+
     if (sheet.getLastRow() === 0) {
-      var headers = ['Patient Name', 'Member ID', 'Auth Number', 'Approved Visits', 'Start Date', 'End Date'];
       sheet.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold');
     }
 
@@ -169,28 +212,54 @@ function appendData(patientData) {
     ]);
 
     return { success: true };
-  } catch (e) {
-    return { success: false, error: e.message };
+
+  } catch (error) {
+    return { success: false, error: error.message };
   }
 }
 
+/* ---------------------------------------------------------------------
+ * Flush Attendance Auto-Biller — EOB / remittance advice scanning and
+ * batch reconciliation against the active sheet.
+ * ------------------------------------------------------------------- */
 
-// ---- EOB scanner ----
-
+/**
+ * Sends a screenshot or PDF of an EOB / remittance advice to Gemini and
+ * returns the extracted payment line items as an array. base64Data may be a
+ * raw base64 string or a full "data:<mime>;base64,...." URL — the data:
+ * prefix is stripped here before the file is sent to the Gemini API. A PDF
+ * may have several pages; Gemini is asked to pull claims from all of them.
+ *
+ * @param {string} base64Data Image or PDF data captured from the file input.
+ * @return {{success: boolean, data?: Object[], error?: string}}
+ */
 function processEOBImage(base64Data) {
   try {
+    if (!base64Data) {
+      throw new Error('No image data was received.');
+    }
+
+    var apiKey = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
+    if (!apiKey) {
+      throw new Error('Gemini API key is not configured. In the Apps Script editor, open Project Settings > Script Properties and add a GEMINI_API_KEY property.');
+    }
+
+    var parsedFile = parseDataUrl_(base64Data);
+    var mimeType = parsedFile.mimeType;
+    var cleanBase64 = parsedFile.data;
+
     var prompt = 'This is an insurance EOB / remittance advice, provided as either a single image or a PDF that ' +
-      'may span multiple pages - if there is more than one page, extract claims from every page. The ' +
+      'may span multiple pages — if there is more than one page, extract claims from every page. The ' +
       'payer/insurance company name is shown once near the top (e.g. a company name and address block). It lists ' +
       'one or more patient claims. Each claim starts with a line like "NAME: <Last, First>" and may show ' +
       'HIC/ACNT/ICN numbers, then one or more procedure-code line items (each with its own SERV DATE, an ' +
       'adjustment/reason code such as CO-197, CO-45, or CO-209, and a PROV PD amount), followed by a row labeled ' +
       '"CLAIM TOTALS" that sums those procedure lines, and then usually a separate "Adj to Totals" line below that ' +
-      'with its own PREV PD / INTEREST / NET figures - CLAIM TOTALS and NET are two different numbers and must not ' +
+      'with its own PREV PD / INTEREST / NET figures — CLAIM TOTALS and NET are two different numbers and must not ' +
       'be confused for each other. A single Date and Check/EFT number are also shown once near the top of each ' +
       'page. The payer name, Date, and Check/EFT number apply to every claim on the same page as them.\n\n' +
       'Return ONLY a raw JSON array of objects (no markdown formatting, no backticks, no surrounding text), with ' +
-      'ONE object per claim - that is, per patient per service date. If the same patient name appears in two ' +
+      'ONE object per claim — that is, per patient per service date. If the same patient name appears in two ' +
       'separate claim blocks with different service dates, treat them as two separate objects; if one claim has ' +
       'several procedure-code lines, combine them into a single object. Each object must have these keys, and ' +
       'every value must be a JSON string even if it looks like a number (e.g. "checkNo": "157186", not 157186):\n' +
@@ -202,318 +271,594 @@ function processEOBImage(base64Data) {
       '(e.g. "157186", not "C-157186")\n' +
       '- reasonCode: every distinct adjustment/reason code that appears anywhere in this claim\'s procedure lines, ' +
       'joined with ", " (empty string if none appear)\n' +
-      '- amountPaid: the paid-amount figure on this claim\'s CLAIM TOTALS row specifically - the sum of the PROV ' +
+      '- amountPaid: the paid-amount figure on this claim\'s CLAIM TOTALS row specifically — the sum of the PROV ' +
       'PD column across its procedure lines. Do NOT use the NET figure from the separate "Adj to Totals" line, ' +
       'even when one is shown and even if the two numbers happen to look close. If there is no CLAIM TOTALS row at ' +
       'all, sum the PROV PD amounts across that claim\'s procedure lines yourself instead\n\n' +
       'Use an empty string for any value that is not present.';
 
-    var parsed = callGemini_(prompt, base64Data);
-    if (!Array.isArray(parsed)) parsed = [parsed];
+    var payload = {
+      contents: [
+        {
+          parts: [
+            { text: prompt },
+            {
+              inline_data: {
+                mime_type: mimeType,
+                data: cleanBase64
+              }
+            }
+          ]
+        }
+      ],
+      generationConfig: {
+        temperature: 0.1
+      }
+    };
+
+    var options = {
+      method: 'post',
+      contentType: 'application/json',
+      payload: JSON.stringify(payload),
+      muteHttpExceptions: true
+    };
+
+    var response = UrlFetchApp.fetch(GEMINI_API_URL + '?key=' + apiKey, options);
+    var responseCode = response.getResponseCode();
+    var responseBody = response.getContentText();
+
+    if (responseCode !== 200) {
+      var apiErrorMessage = responseBody;
+      try {
+        var errorJson = JSON.parse(responseBody);
+        if (errorJson.error && errorJson.error.message) {
+          apiErrorMessage = errorJson.error.message;
+        }
+      } catch (parseErrorIgnored) {
+        // Error body wasn't JSON — fall back to the raw response text.
+      }
+      throw new Error('Gemini API error (' + responseCode + '): ' + apiErrorMessage);
+    }
+
+    var responseData = JSON.parse(responseBody);
+    var candidate = responseData.candidates && responseData.candidates[0];
+    var textPart = candidate && candidate.content && candidate.content.parts && candidate.content.parts[0];
+
+    if (!textPart || !textPart.text) {
+      throw new Error('Gemini did not return any readable text. The image may be unclear, unreadable, or blocked by safety filters.');
+    }
+
+    var cleanedText = textPart.text.replace(/```json/gi, '').replace(/```/g, '').trim();
+
+    var parsed;
+    try {
+      parsed = JSON.parse(cleanedText);
+    } catch (jsonErrorIgnored) {
+      throw new Error('Gemini response was not valid JSON: ' + cleanedText);
+    }
+
+    if (!Array.isArray(parsed)) {
+      parsed = [parsed];
+    }
 
     return { success: true, data: parsed.map(normalizeEOBRow_) };
-  } catch (e) {
-    return { success: false, error: e.message };
+
+  } catch (error) {
+    return { success: false, error: error.message };
   }
 }
 
-function normalizeEOBRow_(raw) {
-  var pick = fieldPicker_(raw);
+/**
+ * Maps a single Gemini-returned payment line onto a fixed set of camelCase
+ * keys regardless of the exact casing/spacing/underscoring it used, since
+ * LLM JSON output does not reliably repeat key formatting verbatim.
+ */
+function normalizeEOBRow_(rawRow) {
+  var normalizedMap = {};
+  Object.keys(rawRow || {}).forEach(function (key) {
+    normalizedMap[normalizeKey_(key)] = rawRow[key];
+  });
+
+  function pick() {
+    for (var i = 0; i < arguments.length; i++) {
+      var value = normalizedMap[normalizeKey_(arguments[i])];
+      if (value !== undefined && value !== null && value !== '') {
+        return value;
+      }
+    }
+    return '';
+  }
+
   return {
-    patientName: pick('Patient Name', 'name'),
-    serviceDate: pick('Service Date', 'Date of Service', 'DOS'),
-    insurance: pick('Insurance', 'Insurance Company', 'Payer'),
-    paidDate: pick('Paid Date', 'Date/Check EFT Date', 'Check EFT Date', 'Check Date'),
-    checkNo: String(pick('Check No.', 'Check/EFT Number') || '').trim(),
-    reasonCode: pick('Reason Code', 'Reason'),
-    amountPaid: pick('Amount Paid', 'PROV PD', 'Amount')
+    patientName: pick('Patient Name', 'PatientName', 'patient_name', 'name'),
+    serviceDate: pick('Service Date', 'ServiceDate', 'service_date', 'Date of Service', 'DOS'),
+    insurance: pick('Insurance', 'Insurance Company', 'Payer', 'insurance_company'),
+    paidDate: pick('Paid Date', 'PaidDate', 'paid_date', 'Date/Check EFT Date', 'Check EFT Date', 'Check Date'),
+    checkNo: String(pick('Check No.', 'Check No', 'CheckNo', 'check_no', 'Check/EFT Number', 'Check EFT Number') || '').trim(),
+    reasonCode: pick('Reason Code', 'ReasonCode', 'reason_code', 'Reason'),
+    amountPaid: pick('Amount Paid', 'AmountPaid', 'amount_paid', 'PROV PD', 'Amount')
   };
 }
 
-
-// "$1,234.56" -> 1234.56 so the amount column stays a number. Leaves it alone if it isn't one.
-function parseAmount_(value) {
-  if (value === '' || value === null || value === undefined) return '';
-  const n = parseFloat(String(value).replace(/[^0-9.-]/g, ''));
-  return isNaN(n) ? value : n;
-}
-
-// turns a date cell or a string like "07/16/26" into M/D/YYYY so two dates can be compared
-function normalizeDateForCompare_(value) {
-  if (value instanceof Date) {
-    return (value.getMonth() + 1) + '/' + value.getDate() + '/' + value.getFullYear();
-  }
-  const str = String(value || '').trim();
-  if (!str) return '';
-
-  const d = new Date(str);
-  if (!isNaN(d.getTime()) && /\d/.test(str)) {
-    return (d.getMonth() + 1) + '/' + d.getDate() + '/' + d.getFullYear();
-  }
-  return str.toLowerCase();
-}
-
-
-// Fills in Paid Date / Reason / Check No. / Amount (and Insurance if it's blank) for the
-// payments the sidebar scanned.
-//
-// The attendance tabs are laid out like this: a date heading in column A ("08/21/26(FRI.)"
-// or "March 16,2026(MON.)"), then one row per patient under it. Whoever logs the visit types
-// the name + insurance that day and the payment columns stay empty until the EOB comes in.
-// So this never adds rows, it only fills in ones that are still blank.
-//
-// Returns counts for the sidebar:
-//   updatedCount    rows we filled in
-//   duplicateCount  row already has this exact payment (same EOB scanned twice)
-//   conflicts       row already has different payment info, left alone
-//   unresolved      no row found for that name + service date
-function reconcilePayments(payments) {
+/**
+ * Batch-reconciles extracted EOB payment lines into the tab picked in the sidebar. Not
+ * specific to any one office's tab: every column this needs (Patient
+ * Name, Paid Date, Reason, Check No., Amount, Insurance) is located by
+ * header text rather than a fixed position, so any sheet reusing the same
+ * headings works the same way regardless of which columns they land in —
+ * only the Patient Name column falls back to column A when nothing labels
+ * it, matching every version of this particular ledger seen so far. That
+ * column holds either a date-heading row ("March 16,2026(MON.)" or
+ * "08/21/26(FRI.)", as text or an actual Date cell) marking a visit date,
+ * or a patient name below that heading (often prefixed with a list number,
+ * e.g. "21. ZHU, XINGJIA"), until a blank row ends the group. A row is
+ * created the day the patient is seen (Name + Insurance only) and its Paid
+ * Date/Reason/Check No./Amount are filled in later, on that same row, once
+ * the EOB arrives — so reconciling means finding that row, not adding a
+ * new one.
+ *
+ * For each extracted payment: find the heading whose date matches the
+ * payment's Service Date, then within that group find a row for the same
+ * patient that's still unreconciled (Paid Date/Check No./Amount all blank)
+ * and fill it in. This never adds a row to the sheet under any
+ * circumstance — every row it can ever touch already exists, created ahead
+ * of time by whoever logs the visit. If every matching row is already
+ * reconciled, nothing is written: an exact repeat (same patient/paid
+ * date/check no./amount) is counted as a duplicate — expected when the
+ * same EOB gets scanned twice — and anything else that already has
+ * different data recorded is reported as a conflict for manual review
+ * instead of being guessed at. A payment with no matching row at all
+ * (wrong/missing service date, or the visit was never logged) is reported
+ * as unresolved, also without writing anywhere.
+ *
+ * The payments go to the tab picked in the sidebar's "Post to tab" dropdown
+ * (sheetName). Without a sheetName it falls back to whichever tab is open,
+ * which is how it worked before the sidebar had the dropdown.
+ *
+ * @param {Object[]} paymentDataArray Rows shaped like normalizeEOBRow_'s output.
+ * @param {string=} sheetName Name of the attendance tab to post to.
+ * @return {{success: boolean, sheetName?: string, updatedCount?: number,
+ *           duplicateCount?: number, conflictCount?: number, conflicts?: string[],
+ *           unresolvedCount?: number, unresolved?: string[], error?: string}}
+ */
+function reconcilePayments(paymentDataArray, sheetName) {
   try {
-    if (!payments || !payments.length) {
+    if (!paymentDataArray || !paymentDataArray.length) {
       throw new Error('No payment records to reconcile.');
     }
 
-    const sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
-    const lastCol = sheet.getLastColumn();
-    const lastRow = sheet.getLastRow();
-
-    if (lastCol < 1 || lastRow < 2) {
-      throw new Error('The active sheet does not look like the Flush Attendance ledger (expected a header row followed by data).');
+    var spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+    var sheet = sheetName ? spreadsheet.getSheetByName(sheetName) : spreadsheet.getActiveSheet();
+    if (!sheet) {
+      throw new Error('There is no tab named "' + sheetName + '" anymore. It may have been renamed or deleted; click ↻ next to the tab list to reload it.');
     }
 
-    // Find the columns by their header text so any tab with the same headings works.
-    // The headers are in row 1 on some tabs and row 2 on others, so look at the first few rows.
-    // The name column usually has no label at all (it's just column A), so that's the fallback.
-    let nameCol, paidCol, reasonCol, checkCol, amountCol, insuranceCol;
-    let lastHeaderRow = 1;
-    const headerRows = Math.min(4, lastRow);
-    const hdr = sheet.getRange(1, 1, headerRows, lastCol).getValues();
-
-    for (let r = 0; r < hdr.length; r++) {
-      for (let c = 0; c < lastCol; c++) {
-        const key = normalizeKey_(hdr[r][c]); // lowercase, no punctuation
-        if (!key) continue;
-
-        let isHeader = true;
-        if (!nameCol && (key === 'patientname' || key === 'patient' || key === 'name')) {
-          nameCol = c + 1;
-        } else if (!paidCol && key === 'paiddate') {
-          paidCol = c + 1;
-        } else if (!reasonCol && (key === 'reason' || key === 'reasoncode')) {
-          reasonCol = c + 1;
-        } else if (!checkCol && key === 'checkno') {
-          checkCol = c + 1;
-        } else if (!amountCol && (key === 'amount' || key === 'amountpaid')) {
-          amountCol = c + 1;
-        } else if (!insuranceCol && key === 'insurance') {
-          insuranceCol = c + 1;
-        } else {
-          isHeader = false;
-        }
-        if (isHeader) lastHeaderRow = Math.max(lastHeaderRow, r + 1);
-      }
+    var ledger = findLedgerColumns_(sheet);
+    if (!ledger) {
+      throw new Error('The "' + sheet.getName() + '" tab does not look like an attendance tab: could not find Paid Date / Reason / Check No. / Amount headers in its first ' + LEDGER_HEADER_ROWS + ' rows.');
     }
 
-    nameCol = nameCol || 1;
-
-    if (!paidCol || !reasonCol || !checkCol || !amountCol) {
-      throw new Error('Could not find Paid Date / Reason / Check No. / Amount headers in the first ' + headerRows + ' rows of the active sheet.');
-    }
-
-    const firstDataRow = lastHeaderRow + 1;
-    const data = lastRow >= firstDataRow
-      ? sheet.getRange(firstDataRow, 1, lastRow - firstDataRow + 1, lastCol).getValues()
+    var nameCol = ledger.nameCol;
+    var paidDateCol = ledger.paidDateCol;
+    var reasonCol = ledger.reasonCol;
+    var checkNoCol = ledger.checkNoCol;
+    var amountCol = ledger.amountCol;
+    var insuranceCol = ledger.insuranceCol;
+    var lastCol = ledger.lastCol;
+    var lastRow = ledger.lastRow;
+    var dataStartRow = ledger.dataStartRow;
+    var grid = lastRow >= dataStartRow
+      ? sheet.getRange(dataStartRow, 1, lastRow - dataStartRow + 1, lastCol).getValues()
       : [];
 
-    // go down the sheet and put each patient row in the group for the date heading above it
-    const groups = [];
-    let current = null;
-    data.forEach(function (row, i) {
-      const heading = parseHeadingDate_(row[nameCol - 1]);
-      if (heading) {
-        current = { date: heading, rows: [] };
-        groups.push(current);
-        return;
+    // Walk the sheet top to bottom, grouping patient rows under whichever
+    // date heading they fall below (a blank row or the next heading ends
+    // the group).
+    var groups = [];
+    var currentGroup = null;
+
+    for (var r = 0; r < grid.length; r++) {
+      var rowValues = grid[r];
+      var sheetRow = dataStartRow + r;
+      var headingDate = parseHeadingDate_(rowValues[nameCol - 1]);
+
+      if (headingDate) {
+        currentGroup = { headingDate: headingDate, lastRow: sheetRow, rows: [] };
+        groups.push(currentGroup);
+        continue;
       }
 
-      const name = String(row[nameCol - 1] || '').trim();
-      if (!name || /^closed$/i.test(name)) return;
+      var nameCellText = String(rowValues[nameCol - 1] || '').trim();
+      if (!nameCellText || /^closed$/i.test(nameCellText)) {
+        continue;
+      }
 
-      if (current) {
-        current.rows.push({
-          sheetRow: firstDataRow + i,
-          name: name,
-          insurance: insuranceCol ? row[insuranceCol - 1] : '',
-          paidDate: row[paidCol - 1],
-          checkNo: row[checkCol - 1],
-          amount: row[amountCol - 1]
+      if (currentGroup) {
+        currentGroup.rows.push({
+          sheetRow: sheetRow,
+          patientName: nameCellText,
+          insurance: insuranceCol ? rowValues[insuranceCol - 1] : '',
+          paidDate: rowValues[paidDateCol - 1],
+          checkNo: rowValues[checkNoCol - 1],
+          amount: rowValues[amountCol - 1]
         });
+        currentGroup.lastRow = sheetRow;
       }
+    }
+
+    var groupsByDate = {};
+    groups.forEach(function (group) {
+      (groupsByDate[group.headingDate] = groupsByDate[group.headingDate] || []).push(group);
     });
 
-    const byDate = {};
-    groups.forEach(function (g) {
-      (byDate[g.date] = byDate[g.date] || []).push(g);
-    });
+    var checkNoPrefix = detectCheckNoPrefix_(groups);
 
-    const checkPrefix = detectCheckNoPrefix_(groups);
+    var updatedCount = 0;
+    var duplicateCount = 0;
+    var conflicts = [];
+    var unresolved = [];
 
-    let updated = 0;
-    let duplicates = 0;
-    const conflicts = [];
-    const unresolved = [];
+    paymentDataArray.forEach(function (payment) {
+      var serviceDateKey = normalizeDateForCompare_(payment.serviceDate);
+      var candidateGroups = groupsByDate[serviceDateKey];
 
-    payments.forEach(function (p) {
-      const who = p.patientName || '(blank name)';
-      const when = p.serviceDate || '(blank date)';
-      const candidates = byDate[normalizeDateForCompare_(p.serviceDate)];
-
-      if (!candidates || !candidates.length) {
-        unresolved.push(who + ' - no ' + when + ' section found');
+      if (!candidateGroups || !candidateGroups.length) {
+        unresolved.push((payment.patientName || '(blank name)') + ' — no ' + (payment.serviceDate || '(blank date)') + ' section found');
         return;
       }
 
-      // look at every row for this patient under that date
-      const mine = fingerprintPayment_(p);
-      let blank = null;
-      let sawFilled = false;
-      let sameAsExisting = false;
+      var blankRow = null;
+      var isDuplicate = false;
+      var hasReconciledMatch = false;
 
-      candidates.forEach(function (g) {
-        g.rows.forEach(function (row) {
-          if (!namesMatch_(row.name, p.patientName)) return;
-
-          if (!(row.paidDate || row.checkNo || row.amount)) {
-            blank = blank || row;
+      candidateGroups.forEach(function (group) {
+        group.rows.forEach(function (row) {
+          if (!namesMatch_(row.patientName, payment.patientName)) {
             return;
           }
-
-          sawFilled = true;
-          const existing = fingerprintPayment_({ patientName: row.name, paidDate: row.paidDate, checkNo: row.checkNo, amountPaid: row.amount });
-          if (existing === mine) sameAsExisting = true;
+          var alreadyReconciled = row.paidDate || row.checkNo || row.amount;
+          if (!alreadyReconciled) {
+            blankRow = blankRow || row;
+            return;
+          }
+          hasReconciledMatch = true;
+          var existingFingerprint = fingerprintPayment_({ patientName: row.patientName, paidDate: row.paidDate, checkNo: row.checkNo, amountPaid: row.amount });
+          if (existingFingerprint === fingerprintPayment_(payment)) {
+            isDuplicate = true;
+          }
         });
       });
 
-      if (blank) {
-        // only ever write into a row that's still blank. Anything already filled in
-        // (same payment or a different one) gets reported and left alone.
-        const at = blank.sheetRow;
-        const checkNo = formatCheckNo_(p.checkNo, checkPrefix);
-        const amount = parseAmount_(p.amountPaid);
-
-        sheet.getRange(at, paidCol).setValue(p.paidDate || '');
-        sheet.getRange(at, reasonCol).setValue(p.reasonCode || '');
-        sheet.getRange(at, checkCol).setValue(checkNo);
-        sheet.getRange(at, amountCol).setValue(amount);
-        if (insuranceCol && !blank.insurance) {
-          sheet.getRange(at, insuranceCol).setValue(p.insurance || '');
+      // Only ever write into a row that's genuinely still blank. A match
+      // that already has payment data — whether an exact repeat or one
+      // that looks like a correction — is reported, never written: this
+      // ledger's rows are created ahead of time by whoever logs the visit,
+      // so a row that's already filled in is not this function's to change,
+      // and nothing new gets added to the sheet either way.
+      if (blankRow) {
+        sheet.getRange(blankRow.sheetRow, paidDateCol).setValue(payment.paidDate || '');
+        sheet.getRange(blankRow.sheetRow, reasonCol).setValue(payment.reasonCode || '');
+        sheet.getRange(blankRow.sheetRow, checkNoCol).setValue(formatCheckNo_(payment.checkNo, checkNoPrefix));
+        sheet.getRange(blankRow.sheetRow, amountCol).setValue(parseAmount_(payment.amountPaid));
+        if (insuranceCol && !blankRow.insurance) {
+          sheet.getRange(blankRow.sheetRow, insuranceCol).setValue(payment.insurance || '');
         }
-
-        // remember what we wrote, so a second payment for the same visit in this batch
-        // sees a filled row instead of writing over this one
-        blank.paidDate = p.paidDate || '';
-        blank.checkNo = checkNo;
-        blank.amount = amount;
-        updated++;
-      } else if (sameAsExisting) {
-        duplicates++;
-      } else if (sawFilled) {
-        conflicts.push(who + ' on ' + when + ' already has different payment data recorded - left unchanged');
+        updatedCount++;
+      } else if (isDuplicate) {
+        duplicateCount++;
+      } else if (hasReconciledMatch) {
+        conflicts.push((payment.patientName || '(blank name)') + ' on ' + (payment.serviceDate || '(blank date)') + ' already has different payment data recorded — left unchanged');
       } else {
-        unresolved.push(who + ' - no matching row found under ' + when);
+        unresolved.push((payment.patientName || '(blank name)') + ' — no matching row found under ' + (payment.serviceDate || '(blank date)'));
       }
     });
 
     return {
       success: true,
-      updatedCount: updated,
-      duplicateCount: duplicates,
+      sheetName: sheet.getName(),
+      updatedCount: updatedCount,
+      duplicateCount: duplicateCount,
       conflictCount: conflicts.length,
       conflicts: conflicts,
       unresolvedCount: unresolved.length,
       unresolved: unresolved
     };
-  } catch (e) {
-    return { success: false, error: e.message };
+
+  } catch (error) {
+    return { success: false, error: error.message };
   }
 }
 
-// Headings look like "08/21/26(FRI.)" or "March 16,2026(MON.) (billed)", and on some tabs
-// (Jackson Heights) they're real date cells. Gives back M/D/YYYY, or '' if it's not a heading.
-function parseHeadingDate_(cell) {
-  if (cell instanceof Date) return normalizeDateForCompare_(cell);
+/** How many rows from the top of a tab to search for the column headers. */
+var LEDGER_HEADER_ROWS = 4;
 
-  const text = String(cell || '').trim();
-  const m = text.match(/^([A-Za-z]{3,9}\.?\s+\d{1,2}\s*,\s*\d{4}|\d{1,2}\/\d{1,2}\/\d{2,4})/);
-  return m ? normalizeDateForCompare_(m[1]) : '';
+/**
+ * Lists the tabs the Flush Attendance sidebar can post payments to, for its
+ * "Post to tab" dropdown: every tab that has the Paid Date / Reason /
+ * Check No. / Amount headers, in the same order as the tabs along the bottom
+ * of the sheet. `active` is the tab that's open right now, so the dropdown
+ * can start on it.
+ *
+ * @return {{success: boolean, tabs?: {name: string, hidden: boolean}[],
+ *           active?: string, error?: string}}
+ */
+function getLedgerTabs() {
+  try {
+    var spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+    var tabs = [];
+    spreadsheet.getSheets().forEach(function (sheet) {
+      if (sheet.getType() !== SpreadsheetApp.SheetType.GRID) {
+        return; // chart-only tabs have no cells to post to
+      }
+      if (findLedgerColumns_(sheet)) {
+        tabs.push({ name: sheet.getName(), hidden: sheet.isSheetHidden() });
+      }
+    });
+    return { success: true, tabs: tabs, active: spreadsheet.getActiveSheet().getName() };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
 }
 
-// one string per payment so a scanned claim can be compared to what's already on a row
-function fingerprintPayment_(p) {
+/**
+ * Finds the columns reconciliation needs on one tab. Every header is located
+ * by label text rather than a fixed position, so any sheet that reuses the
+ * same headings works the same way regardless of which office it's for or
+ * which column they land in — labels have moved between row 1 and row 2
+ * across different exports of this same sheet, so a few rows are searched
+ * rather than assuming a fixed layout. The one column with no reliable label
+ * of its own is the patient-name/date-heading column: if something
+ * recognizable ("Patient Name", "Patient", "Name") is found, that column is
+ * used; if not — as in this ledger's own sheet, which has never consistently
+ * labeled it — column A is assumed, since every version of this sheet seen so
+ * far has used it that way regardless of whether it carries a label.
+ *
+ * @param {GoogleAppsScript.Spreadsheet.Sheet} sheet
+ * @return {?{nameCol: number, paidDateCol: number, reasonCol: number,
+ *           checkNoCol: number, amountCol: number, insuranceCol: (number|undefined),
+ *           dataStartRow: number, lastRow: number, lastCol: number}}
+ *         null when the tab is empty or is missing any of the payment headers.
+ */
+function findLedgerColumns_(sheet) {
+  var lastCol = sheet.getLastColumn();
+  var lastRow = sheet.getLastRow();
+  if (lastCol < 1 || lastRow < 2) {
+    return null;
+  }
+
+  var nameCol, paidDateCol, reasonCol, checkNoCol, amountCol, insuranceCol;
+  var lastHeaderRow = 1;
+  var headerSearchRows = Math.min(LEDGER_HEADER_ROWS, lastRow);
+  var headerGrid = sheet.getRange(1, 1, headerSearchRows, lastCol).getValues();
+
+  for (var hr = 0; hr < headerGrid.length; hr++) {
+    for (var hc = 0; hc < lastCol; hc++) {
+      var key = normalizeKey_(headerGrid[hr][hc]);
+      if (!key) {
+        continue;
+      }
+      var found = true;
+      if (!nameCol && (key === normalizeKey_('Patient Name') || key === normalizeKey_('Patient') || key === normalizeKey_('Name'))) {
+        nameCol = hc + 1;
+      } else if (!paidDateCol && key === normalizeKey_('Paid Date')) {
+        paidDateCol = hc + 1;
+      } else if (!reasonCol && (key === normalizeKey_('Reason') || key === normalizeKey_('Reason Code'))) {
+        reasonCol = hc + 1;
+      } else if (!checkNoCol && (key === normalizeKey_('Check No.') || key === normalizeKey_('Check No'))) {
+        checkNoCol = hc + 1;
+      } else if (!amountCol && (key === normalizeKey_('Amount') || key === normalizeKey_('Amount Paid'))) {
+        amountCol = hc + 1;
+      } else if (!insuranceCol && key === normalizeKey_('Insurance')) {
+        insuranceCol = hc + 1;
+      } else {
+        found = false;
+      }
+      if (found) {
+        lastHeaderRow = Math.max(lastHeaderRow, hr + 1);
+      }
+    }
+  }
+
+  if (!paidDateCol || !reasonCol || !checkNoCol || !amountCol) {
+    return null;
+  }
+
+  return {
+    nameCol: nameCol || 1,
+    paidDateCol: paidDateCol,
+    reasonCol: reasonCol,
+    checkNoCol: checkNoCol,
+    amountCol: amountCol,
+    insuranceCol: insuranceCol, // undefined when the tab has no Insurance column
+    dataStartRow: lastHeaderRow + 1,
+    lastRow: lastRow,
+    lastCol: lastCol
+  };
+}
+
+/**
+ * Detects whether a column-A cell is a date-heading row rather than a
+ * patient name, and returns its date normalized to M/D/YYYY for grouping.
+ * Takes the raw cell value (not a pre-stringified one) because some of
+ * these attendance sheets store the heading as an actual Date cell (e.g.
+ * Jackson Heights Attendance) rather than decorated text like flush
+ * attendance's "March 16,2026(MON.) (billed)" or "08/21/26(FRI.)" —
+ * stringifying a Date first would turn it into its default
+ * "Sat Aug 15 2026 00:00:00 GMT..." form, which matches neither pattern.
+ * Returns '' for anything else (patient names, blank rows, "CLOSED").
+ */
+function parseHeadingDate_(cellValue) {
+  if (cellValue instanceof Date) {
+    return normalizeDateForCompare_(cellValue);
+  }
+  var cellText = String(cellValue || '').trim();
+  if (!cellText) {
+    return '';
+  }
+  var match = cellText.match(/^([A-Za-z]{3,9}\.?\s+\d{1,2}\s*,\s*\d{4}|\d{1,2}\/\d{1,2}\/\d{2,4})/);
+  return match ? normalizeDateForCompare_(match[1]) : '';
+}
+
+/**
+ * Builds a dedupe key for a payment (from Gemini, or read back off an
+ * already-reconciled sheet row) so a freshly-scanned claim can be checked
+ * against a row already filled in for the same patient/visit before
+ * inserting a second row. Patient name is reduced to a sorted set of words
+ * so "Zhou, Xia Fen" and "Xia Fen Zhou" collapse to the same key regardless
+ * of comma/order differences between the sheet's historical entries and
+ * Gemini's extraction.
+ */
+function fingerprintPayment_(payment) {
   return [
-    normalizeNameForMatch_(p.patientName),
-    normalizeDateForCompare_(p.paidDate),
-    checkNoDigits_(p.checkNo),
-    parseAmount_(p.amountPaid)
+    normalizeNameForMatch_(payment.patientName),
+    normalizeDateForCompare_(payment.paidDate),
+    checkNoDigits_(payment.checkNo),
+    parseAmount_(payment.amountPaid)
   ].join('|');
 }
 
-// C-157186, W354266534 and a plain 157186 all boil down to the same digits
-function checkNoDigits_(raw) {
-  return String(raw || '').trim().replace(/^[A-Za-z]+-?/, '').toLowerCase();
+/**
+ * Strips any leading letter prefix off a check/EFT number for comparison
+ * purposes, so "C-157186" (flush attendance's convention), "W354266534"
+ * (Jackson Heights Attendance's), and a bare "157186" (straight off the
+ * EOB) all reduce to the same key regardless of which sheet they came from
+ * or whether Gemini's raw extraction happened to include a prefix.
+ */
+function checkNoDigits_(rawCheckNo) {
+  return String(rawCheckNo || '').trim().replace(/^[A-Za-z]+-?/, '').toLowerCase();
 }
 
-// On the flush tab check numbers look like "C-157186". A bare "157186" can end up formatted
-// like currency by the column ($157,186.00), so it always gets a prefix.
-function formatCheckNo_(raw, prefix) {
-  const digits = checkNoDigits_(raw);
+/**
+ * Formats a check/EFT number for writing, applying whatever prefix
+ * convention this specific sheet already uses (detected by
+ * detectCheckNoPrefix_) rather than a hardcoded one — different offices'
+ * ledgers use different conventions (or none), and forcing one sheet's
+ * convention onto another would misrepresent the actual check number.
+ * Also guarantees the result is a definite text string: Gemini sometimes
+ * returns the check number as a raw JSON number, and setValue() with a bare
+ * number renders through the cell's existing format — e.g. a currency
+ * format would turn 157186 into "$157,186.00".
+ */
+function formatCheckNo_(rawCheckNo, prefix) {
+  var digits = checkNoDigits_(rawCheckNo);
   return digits ? (prefix || '') + digits : '';
 }
 
-// Other offices don't use C-. Jackson Heights mostly has no prefix, some W and V. So look at
-// what's already on the sheet and copy whichever is most common. Nothing there yet -> "C-".
+/**
+ * Looks at every existing Check No. value already in the sheet and returns
+ * whichever letter prefix (e.g. "C-") is most common there — this sheet's
+ * own history is a better guide to its convention than assuming any single
+ * office's format applies everywhere (Jackson Heights Attendance, for
+ * example, leans toward no prefix at all). Defaults to "C-" only when there
+ * is no existing Check No. data anywhere to learn a convention from, since
+ * a bare numeric string is otherwise indistinguishable from a real number
+ * to Sheets and gets rendered through whatever number format that cell
+ * already has — e.g. a currency format turning "157186" into "$157,186.00"
+ * even though it was written as text.
+ */
 function detectCheckNoPrefix_(groups) {
-  const counts = {};
-  groups.forEach(function (g) {
-    g.rows.forEach(function (row) {
-      const raw = String(row.checkNo || '').trim();
-      if (!raw) return;
-
-      const m = raw.match(/^([A-Za-z]+)-?/);
-      const prefix = m ? m[1].toUpperCase() + '-' : '';
+  var counts = {};
+  groups.forEach(function (group) {
+    group.rows.forEach(function (row) {
+      var raw = String(row.checkNo || '').trim();
+      if (!raw) {
+        return;
+      }
+      var match = raw.match(/^([A-Za-z]+)-?/);
+      var prefix = match ? match[1].toUpperCase() + '-' : '';
       counts[prefix] = (counts[prefix] || 0) + 1;
     });
   });
 
-  let best = 'C-';
-  let bestCount = -1;
+  var bestPrefix = 'C-';
+  var bestCount = -1;
   Object.keys(counts).forEach(function (prefix) {
     if (counts[prefix] > bestCount) {
       bestCount = counts[prefix];
-      best = prefix;
+      bestPrefix = prefix;
     }
   });
-  return best;
+  return bestPrefix;
 }
 
+/**
+ * Normalizes a string for case/whitespace-insensitive comparison.
+ */
 function normalizeText_(value) {
   return String(value || '').trim().toLowerCase().replace(/\s+/g, ' ');
 }
 
-// Names in the sheet are all over the place: "21. ZHU, XINGJIA", "ZHU XINGJIA", "XINGJIA ZHU".
-// Drop the list number and commas, then sort the words so the order doesn't matter.
+/**
+ * Normalizes a patient name to a sorted set of words so "Last, First" and
+ * "First Last" (and stray extra spaces around the comma) compare equal —
+ * this sheet's historical entries use both conventions interchangeably. A
+ * leading list number, e.g. "21. ZHU, XINGJIA" or "9.LAU, TSUENLEUNG", is
+ * stripped first — the sheet bakes that numbering into the same cell as
+ * the name, but Gemini's extraction never includes it.
+ */
 function normalizeNameForMatch_(name) {
-  const noNumber = String(name || '').replace(/^\s*\d+\.\s*/, '');
-  return normalizeText_(noNumber).replace(/,/g, ' ').split(/\s+/).filter(Boolean).sort().join(' ');
+  var withoutListNumber = String(name || '').replace(/^\s*\d+\.\s*/, '');
+  var tokens = normalizeText_(withoutListNumber).replace(/,/g, ' ').split(/\s+/).filter(function (token) {
+    return token;
+  });
+  tokens.sort();
+  return tokens.join(' ');
 }
 
-// second chance for JINXI vs JIN XI and LONGGUAN vs LONG GUAN. Sorting words can't fix those
-// because the number of words changes.
+/**
+ * Strips a name down to just its letters, in original order, with no
+ * spacing or punctuation at all. On its own this doesn't tolerate "Last,
+ * First" vs "First Last" reordering the way normalizeNameForMatch_ does,
+ * but it does catch a different real inconsistency in this sheet: a
+ * transliterated given name written as one fused word in some entries and
+ * two spaced words in others (e.g. "JINXI" vs "JIN XI", "LONGGUAN" vs
+ * "LONG GUAN") — spacing that sorted-word comparison can't paper over
+ * because it changes how many tokens there are.
+ */
 function normalizeNameLettersOnly_(name) {
-  return String(name || '').replace(/^\s*\d+\.\s*/, '').toLowerCase().replace(/[^a-z]/g, '');
+  var withoutListNumber = String(name || '').replace(/^\s*\d+\.\s*/, '');
+  return withoutListNumber.toLowerCase().replace(/[^a-z]/g, '');
 }
 
-function namesMatch_(a, b) {
-  return normalizeNameForMatch_(a) === normalizeNameForMatch_(b) ||
-    normalizeNameLettersOnly_(a) === normalizeNameLettersOnly_(b);
+/**
+ * True if two patient names refer to the same person under either
+ * tolerance above — sorted-word match (handles reordering) or letters-only
+ * match (handles fused/split spelling variants).
+ */
+function namesMatch_(nameA, nameB) {
+  return normalizeNameForMatch_(nameA) === normalizeNameForMatch_(nameB) ||
+    normalizeNameLettersOnly_(nameA) === normalizeNameLettersOnly_(nameB);
+}
+
+/**
+ * Normalizes a date-ish cell value (sheet Date object or Gemini date string)
+ * to M/D/YYYY for comparison; falls back to a lowercased string compare
+ * when the value can't be parsed as a date.
+ */
+function normalizeDateForCompare_(value) {
+  if (value instanceof Date) {
+    return (value.getMonth() + 1) + '/' + value.getDate() + '/' + value.getFullYear();
+  }
+  var str = String(value || '').trim();
+  if (!str) {
+    return '';
+  }
+  var parsed = new Date(str);
+  if (!isNaN(parsed.getTime()) && /\d/.test(str)) {
+    return (parsed.getMonth() + 1) + '/' + parsed.getDate() + '/' + parsed.getFullYear();
+  }
+  return str.toLowerCase();
+}
+
+/**
+ * Strips currency formatting (e.g. "$1,234.56") down to a number so
+ * reconciled amounts stay numeric in the sheet; returns the original value
+ * unchanged if it can't be parsed as a number.
+ */
+function parseAmount_(value) {
+  if (value === '' || value === null || value === undefined) {
+    return '';
+  }
+  var numeric = parseFloat(String(value).replace(/[^0-9.-]/g, ''));
+  return isNaN(numeric) ? value : numeric;
 }
