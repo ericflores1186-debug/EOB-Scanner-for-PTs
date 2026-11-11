@@ -20,6 +20,8 @@ function onOpen() {
     .createMenu('The Flores Automated PT Helper')
     .addItem('Open Scanner', 'showSidebar')
     .addItem('Open Flush Attendance Scanner', 'showFlushSidebar')
+    .addItem('Open Sign-in Sheet Scanner', 'showSignInSidebar')
+    .addItem('Open Scanner Log', 'showUsageLog')
     .addToUi();
 }
 
@@ -387,9 +389,12 @@ function processEOBImage(base64Data) {
       parsed = [parsed];
     }
 
-    return { success: true, data: parsed.map(normalizeEOBRow_) };
+    var payments = parsed.map(normalizeEOBRow_);
+    logUsage_('EOB scanner', 'Scan EOB', true, payments.length + ' payment line' + (payments.length === 1 ? '' : 's'));
+    return { success: true, data: payments };
 
   } catch (error) {
+    logUsage_('EOB scanner', 'Scan EOB', false, error.message);
     return { success: false, error: error.message };
   }
 }
@@ -599,6 +604,9 @@ function reconcilePayments(paymentDataArray, sheetName) {
       }
     });
 
+    logUsage_('EOB scanner', 'Reconcile', true, 'Tab "' + sheet.getName() + '": filled ' + updatedCount +
+      ', already there ' + duplicateCount + ', different data ' + conflicts.length + ', no match ' + unresolved.length);
+
     return {
       success: true,
       sheetName: sheet.getName(),
@@ -611,6 +619,7 @@ function reconcilePayments(paymentDataArray, sheetName) {
     };
 
   } catch (error) {
+    logUsage_('EOB scanner', 'Reconcile', false, error.message);
     return { success: false, error: error.message };
   }
 }
@@ -907,4 +916,1098 @@ function parseAmount_(value) {
   }
   var numeric = parseFloat(String(value).replace(/[^0-9.-]/g, ''));
   return isNaN(numeric) ? value : numeric;
+}
+
+/* ---------------------------------------------------------------------
+ * Sign-in sheets: reads the patients off a photo of the front desk's
+ * sign-in sheet and adds that day's visit rows to an attendance tab, laid
+ * out like the tab's latest day, so reconcilePayments can fill in the
+ * payment once the EOB arrives. Unlike reconcilePayments this does add
+ * rows, but only below the tab's last row (or right after the rows already
+ * entered for the same day), and never over a cell that has anything in it.
+ * ------------------------------------------------------------------- */
+
+/** How many of a tab's latest patient rows show how it writes names (numbers, commas, capitals). */
+var ATTENDANCE_STYLE_ROWS = 40;
+
+/** Most empty rows copied from just above (or just below) a tab's latest date row. */
+var ATTENDANCE_MAX_SPACER_ROWS = 4;
+
+/** Month names, for date rows written like "March 16,2026(MON.)". */
+var MONTH_NAMES = ['January', 'February', 'March', 'April', 'May', 'June', 'July',
+  'August', 'September', 'October', 'November', 'December'];
+
+/** Weekdays, for date rows written like "01/04/24(THU.)". */
+var WEEKDAY_NAMES = ['SUN', 'MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT'];
+
+/** Accented letters and the plain letters they are matched and written as. */
+var ACCENTED_LETTERS = {
+  '\u00e1': 'a', '\u00e0': 'a', '\u00e4': 'a', '\u00e2': 'a', '\u00e3': 'a', '\u00e5': 'a',
+  '\u00e9': 'e', '\u00e8': 'e', '\u00eb': 'e', '\u00ea': 'e',
+  '\u00ed': 'i', '\u00ec': 'i', '\u00ef': 'i', '\u00ee': 'i',
+  '\u00f3': 'o', '\u00f2': 'o', '\u00f6': 'o', '\u00f4': 'o', '\u00f5': 'o',
+  '\u00fa': 'u', '\u00f9': 'u', '\u00fc': 'u', '\u00fb': 'u',
+  '\u00f1': 'n', '\u00e7': 'c'
+};
+
+/**
+ * Serves SignInSidebar.html in the Google Sheets sidebar.
+ */
+function showSignInSidebar() {
+  var html = HtmlService.createHtmlOutputFromFile('SignInSidebar')
+    .setTitle('Sign-in Sheet Scanner')
+    .setWidth(340);
+  SpreadsheetApp.getUi().showSidebar(html);
+}
+
+/**
+ * The tab open in the sheet right now, which is where the Sign-in Sheet
+ * Scanner adds patients: its name, and whether it is an attendance tab
+ * (has the Paid Date / Reason / Check No. / Amount headers that
+ * reconcilePayments needs too).
+ *
+ * @return {{success: boolean, name?: string, isAttendance?: boolean, error?: string}}
+ */
+function getOpenAttendanceTab() {
+  try {
+    var sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+    var isAttendance = sheet.getType() === SpreadsheetApp.SheetType.GRID && !!findLedgerColumns_(sheet);
+    return { success: true, name: sheet.getName(), isAttendance: isAttendance };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+}
+
+/**
+ * Sends a photo or PDF of a patient sign-in sheet to Gemini and returns the
+ * date written on it and the patients who signed in, top to bottom. Nothing
+ * is written to the sheet here.
+ *
+ * @param {string} base64Data Image or PDF data captured from the file input.
+ * @return {{success: boolean, date?: string,
+ *           patients?: Array<{lastName: string, firstName: string}>, error?: string}}
+ */
+function processSignInSheet(base64Data) {
+  try {
+    if (!base64Data) {
+      throw new Error('No image data was received.');
+    }
+
+    var apiKey = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
+    if (!apiKey) {
+      throw new Error('Gemini API key is not configured. In the Apps Script editor, open Project Settings > Script Properties and add a GEMINI_API_KEY property.');
+    }
+
+    var parsedFile = parseDataUrl_(base64Data);
+
+    var prompt = 'This is a photo or scan of a patient sign-in sheet from a physical therapy clinic: a date at ' +
+      'the top, and numbered lines where each patient writes their name when they arrive.\n\n' +
+      'Return ONLY a JSON object, with no markdown and no other text, shaped exactly like this:\n' +
+      '{"date": "MM/DD/YYYY", "patients": [{"lastName": "...", "firstName": "..."}]}\n\n' +
+      'Rules:\n' +
+      '- "date" is the date written at the top of the sheet, as MM/DD/YYYY, or an empty string if there is none.\n' +
+      '- "patients" has one entry for every line with a patient on it, from top to bottom. Skip empty lines, the ' +
+      'column headings and anything crossed out.\n' +
+      '- Some sheets also have each patient\'s name typed or printed on the line, next to the handwriting. When a ' +
+      'line has a typed name, use the typed name, because it is more reliable than the handwriting. A typed name ' +
+      'can sit slightly above or below its handwritten line; keep the patients in the order of the lines.\n' +
+      '- Typed names on these sheets are usually last name first, so "Garcia Ana Maria" is lastName "Garcia" and ' +
+      'firstName "Ana Maria". When it is unclear which part is the last name, use the handwriting on the same ' +
+      'line to decide.\n' +
+      '- Keep every part of each name, including second last names and middle names. If a name is hard to read, ' +
+      'still include it with your best reading; staff check every name before it is added.\n' +
+      '- Ignore arrival times, appointment times and the "Appointment With" column.';
+
+    var payload = {
+      contents: [
+        {
+          parts: [
+            { text: prompt },
+            {
+              inline_data: {
+                mime_type: parsedFile.mimeType,
+                data: parsedFile.data
+              }
+            }
+          ]
+        }
+      ],
+      generationConfig: {
+        temperature: 0.1
+      }
+    };
+
+    var options = {
+      method: 'post',
+      contentType: 'application/json',
+      payload: JSON.stringify(payload),
+      muteHttpExceptions: true
+    };
+
+    var response = fetchGeminiWithRetry_(GEMINI_API_URL + '?key=' + apiKey, options);
+    var responseCode = response.getResponseCode();
+    var responseBody = response.getContentText();
+
+    if (responseCode !== 200) {
+      var apiErrorMessage = responseBody;
+      try {
+        var errorJson = JSON.parse(responseBody);
+        if (errorJson.error && errorJson.error.message) {
+          apiErrorMessage = errorJson.error.message;
+        }
+      } catch (parseErrorIgnored) {
+        // Error body wasn't JSON; fall back to the raw response text.
+      }
+      throw new Error('Gemini API error (' + responseCode + '): ' + apiErrorMessage);
+    }
+
+    var responseData = JSON.parse(responseBody);
+    var candidate = responseData.candidates && responseData.candidates[0];
+    var textPart = candidate && candidate.content && candidate.content.parts && candidate.content.parts[0];
+
+    if (!textPart || !textPart.text) {
+      throw new Error('Gemini did not return any readable text. The photo may be unclear, unreadable, or blocked by safety filters.');
+    }
+
+    var cleanedText = textPart.text.replace(/```json/gi, '').replace(/```/g, '').trim();
+
+    var parsed;
+    try {
+      parsed = JSON.parse(cleanedText);
+    } catch (jsonErrorIgnored) {
+      throw new Error('Gemini response was not valid JSON: ' + cleanedText);
+    }
+
+    var list = Array.isArray(parsed) ? parsed : (parsed && parsed.patients) || [];
+    var patients = [];
+    list.forEach(function (rawPatient) {
+      var patient = normalizeSignInPatient_(rawPatient);
+      if (patient) {
+        patients.push(patient);
+      }
+    });
+
+    var visitDate = parseVisitDate_(parsed && !Array.isArray(parsed) ? parsed.date : '');
+    var dateFound = visitDate ? formatVisitDate_(visitDate) : '';
+    logUsage_('Sign-in scanner', 'Scan sign-in sheet', true, patients.length + ' patient' + (patients.length === 1 ? '' : 's') +
+      (dateFound ? ', date ' + dateFound : ', no date found'));
+    return { success: true, date: dateFound, patients: patients };
+
+  } catch (error) {
+    logUsage_('Sign-in scanner', 'Scan sign-in sheet', false, error.message);
+    return { success: false, error: error.message };
+  }
+}
+
+/**
+ * Reads one patient from Gemini's sign-in reply as {lastName, firstName},
+ * whatever casing or spacing it used for the keys. A reply that only gave a
+ * whole name keeps it as the last name, so it can still be matched.
+ */
+function normalizeSignInPatient_(rawPatient) {
+  if (!rawPatient) {
+    return null;
+  }
+  if (typeof rawPatient !== 'object') {
+    rawPatient = { name: rawPatient };
+  }
+  var byKey = {};
+  Object.keys(rawPatient).forEach(function (key) {
+    byKey[normalizeKey_(key)] = rawPatient[key];
+  });
+  var lastName = cleanText_(byKey.lastname || byKey.last || byKey.surname);
+  var firstName = cleanText_(byKey.firstname || byKey.first || byKey.givenname);
+  if (!lastName && !firstName) {
+    lastName = cleanText_(byKey.name || byKey.patientname || byKey.fullname);
+  }
+  return lastName || firstName ? { lastName: lastName, firstName: firstName } : null;
+}
+
+/**
+ * Works out, without writing anything, what adding the scanned patients to
+ * an attendance tab for one date would do: each patient's name as the tab
+ * already spells it (or, for someone not on the tab yet, written the way
+ * the tab writes names), their insurance from their last visit there, and
+ * whether they are already entered for that date.
+ *
+ * Each row's status is "found" (same name as a patient on the tab),
+ * "close" (a name on the tab a letter or two off, probably the same
+ * patient misread), "new" (not on the tab), "already" (already entered
+ * for that date) or "twice" (listed twice on this sheet). "already" and
+ * "twice" rows are not added.
+ *
+ * @param {string} sheetName The attendance tab open in the sheet.
+ * @param {string} dateText Visit date, e.g. "11/09/2026".
+ * @param {Array<{lastName: string, firstName: string}>} patients From processSignInSheet.
+ * @return {{success: boolean, sheetName?: string, date?: string, newDay?: boolean, dateRow?: string,
+ *           laterDay?: string, rows?: Array<{scanned: string, name: string, insurance: string,
+ *           status: string}>, error?: string}}
+ */
+function previewAttendance(sheetName, dateText, patients) {
+  try {
+    var visitDate = parseVisitDate_(dateText);
+    if (!visitDate) {
+      throw new Error('Type the visit date as MM/DD/YYYY.');
+    }
+
+    var tab = getAttendanceTab_(sheetName);
+    var sameDay = daysOn_(tab, visitDate);
+    var enteredThatDay = patientsOn_(sameDay);
+    if (!sameDay.length) {
+      assertTabIsOpen_(tab);
+    }
+
+    var tabPatients = indexTabPatients_(tab);
+    var nameOrderVotes = { lastNameFirst: 0, firstNameFirst: 0 };
+
+    var rows = (patients || []).map(function (patient) {
+      var lastName = cleanText_(patient && patient.lastName);
+      var firstName = cleanText_(patient && patient.firstName);
+      var row = {
+        scanned: (lastName + ' ' + firstName).trim(),
+        name: '',
+        insurance: '',
+        status: 'new',
+        lastName: lastName,
+        firstName: firstName
+      };
+
+      var match = findTabPatient_(tabPatients, lastName, firstName);
+      if (match) {
+        row.status = 'found';
+        voteNameOrder_(nameOrderVotes, match.name, lastName, firstName);
+      } else {
+        match = closestTabPatient_(tabPatients, lastName, firstName);
+        if (match) {
+          row.status = 'close';
+        }
+      }
+      if (match) {
+        row.name = match.name;
+        row.insurance = cleanText_(match.insurance);
+      }
+      return row;
+    });
+
+    var style = attendanceNameStyle_(tab, nameOrderVotes);
+    rows.forEach(function (row) {
+      // a close match can't be someone another line on this sheet matched exactly (e.g. two
+      // relatives with similar names who both came in); treat it as a new patient instead
+      var takenByExactMatch = row.status === 'close' && rows.some(function (other) {
+        return other.status === 'found' && samePatientName_(other.name, row.name);
+      });
+      if (takenByExactMatch) {
+        row.status = 'new';
+        row.name = '';
+        row.insurance = '';
+      }
+      if (!row.name) {
+        row.name = formatNewPatientName_(style, row.lastName, row.firstName);
+      }
+    });
+
+    var listed = [];
+    rows.forEach(function (row) {
+      if (enteredThatDay.some(function (entered) {
+        return samePatientName_(entered.text, row.name) || samePatientName_(entered.text, row.scanned);
+      })) {
+        row.status = 'already';
+      } else if (listed.some(function (name) { return samePatientName_(name, row.name); })) {
+        row.status = 'twice';
+      } else {
+        listed.push(row.name);
+      }
+      delete row.lastName;
+      delete row.firstName;
+    });
+
+    var latestDay = tab.days[tab.days.length - 1];
+    var latestDate = latestDay ? parseVisitDate_(latestDay.date) : null;
+
+    return {
+      success: true,
+      sheetName: tab.sheet.getName(),
+      date: formatVisitDate_(visitDate),
+      newDay: sameDay.length === 0,
+      dateRow: sameDay.length ? '' : attendanceDateRow_(tab, visitDate).text,
+      laterDay: latestDate && latestDate.getTime() > visitDate.getTime() ? formatVisitDate_(latestDate) : '',
+      rows: rows
+    };
+
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+}
+
+/**
+ * Adds the reviewed sign-in rows to an attendance tab for one date: under
+ * a new date row below the tab's last row, laid out like the tab's latest
+ * day, or, when that date is already on the tab, right after the rows
+ * already entered for it. Patients already entered for that date are
+ * skipped, so adding the same sheet twice adds nothing the second time.
+ * Rows are only written where every cell is empty; if anything is in the
+ * way, fresh rows are inserted instead.
+ *
+ * The patients only go to the tab that is open in the sheet, and only if
+ * it is still sheetName, the tab the sidebar checked the list against. If
+ * another tab was opened since, nothing is added and switchedTo names it,
+ * so the sidebar can check the list again for that tab first.
+ *
+ * @param {string} sheetName The open tab the sidebar checked the list against.
+ * @param {string} dateText Visit date, e.g. "11/09/2026".
+ * @param {Array<{name: string, insurance: string}>} entries The rows to add, as reviewed in the sidebar.
+ * @return {{success: boolean, sheetName?: string, addedCount?: number, skipped?: string[],
+ *           newDay?: boolean, dateRow?: string, firstRow?: number, lastRow?: number,
+ *           switchedTo?: string, error?: string}}
+ */
+function addAttendance(sheetName, dateText, entries) {
+  var lock = LockService.getDocumentLock();
+  if (!lock.tryLock(30000)) {
+    return { success: false, error: 'Someone else is adding to this spreadsheet right now. Wait a moment and click Add again.' };
+  }
+
+  try {
+    var openTabName = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet().getName();
+    if (openTabName !== sheetName) {
+      return {
+        success: false,
+        switchedTo: openTabName,
+        error: 'The sheet is now showing the "' + openTabName + '" tab, not "' + sheetName + '", so nothing was added. ' +
+          'The list is checked again for the tab you have open; look it over and click Add again.'
+      };
+    }
+
+    var visitDate = parseVisitDate_(dateText);
+    if (!visitDate) {
+      throw new Error('Type the visit date as MM/DD/YYYY.');
+    }
+
+    var tab = getAttendanceTab_(sheetName);
+    var sameDay = daysOn_(tab, visitDate);
+    var enteredThatDay = patientsOn_(sameDay);
+
+    var toAdd = [];
+    var skipped = [];
+    (entries || []).forEach(function (entry) {
+      var name = stripListNumber_(cleanText_(entry && entry.name));
+      if (!name) {
+        return;
+      }
+      var alreadyThere = enteredThatDay.some(function (entered) { return samePatientName_(entered.text, name); }) ||
+        toAdd.some(function (added) { return samePatientName_(added.name, name); });
+      if (alreadyThere) {
+        skipped.push(name);
+      } else {
+        toAdd.push({ name: name, insurance: cleanText_(entry && entry.insurance) });
+      }
+    });
+
+    var result = {
+      success: true,
+      sheetName: tab.sheet.getName(),
+      addedCount: toAdd.length,
+      skipped: skipped,
+      newDay: sameDay.length === 0
+    };
+    if (!toAdd.length) {
+      return result;
+    }
+
+    var style = attendanceNameStyle_(tab, { lastNameFirst: 0, firstNameFirst: 0 });
+    var placed;
+    if (sameDay.length) {
+      placed = addToExistingDay_(tab, sameDay[sameDay.length - 1], toAdd, style);
+    } else {
+      assertTabIsOpen_(tab);
+      placed = addNewDay_(tab, visitDate, toAdd, style);
+    }
+    SpreadsheetApp.flush();
+
+    result.dateRow = placed.dateRow || '';
+    result.firstRow = placed.firstRow;
+    result.lastRow = placed.lastRow;
+    logUsage_('Sign-in scanner', 'Add sign-in patients', true, 'Tab "' + result.sheetName + '": added ' + toAdd.length +
+      ' for ' + formatVisitDate_(visitDate) + (result.newDay ? ' under a new date row' : ' under the date already there') +
+      (skipped.length ? ', ' + skipped.length + ' already there' : ''));
+
+    try {
+      tab.sheet.activate();
+      tab.sheet.getRange(placed.firstRow, tab.nameCol, placed.lastRow - placed.firstRow + 1, 1).activate();
+    } catch (selectErrorIgnored) {
+      // Showing the new rows is only a convenience.
+    }
+    return result;
+
+  } catch (error) {
+    logUsage_('Sign-in scanner', 'Add sign-in patients', false, error.message);
+    return { success: false, error: error.message };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * Finds the attendance tab the sidebar names and reads it. Refuses a tab
+ * that reconcilePayments couldn't post to either.
+ */
+function getAttendanceTab_(sheetName) {
+  var sheet = sheetName ? SpreadsheetApp.getActiveSpreadsheet().getSheetByName(sheetName) : null;
+  if (!sheet) {
+    throw new Error('There is no tab named "' + sheetName + '" anymore. It may have been renamed or deleted; click \u21bb next to the tab list to reload it.');
+  }
+  var ledger = findLedgerColumns_(sheet);
+  if (!ledger) {
+    throw new Error('The "' + sheet.getName() + '" tab does not look like an attendance tab: could not find Paid Date / Reason / Check No. / Amount headers in its first ' + LEDGER_HEADER_ROWS + ' rows.');
+  }
+  return readAttendanceTab_(sheet, ledger);
+}
+
+/**
+ * Reads an attendance tab into its days (each date row, see
+ * parseHeadingDate_, with the patient rows under it) and its patient rows in
+ * sheet order. Also keeps the name column by row, so a new day can copy the
+ * layout around the latest one.
+ */
+function readAttendanceTab_(sheet, ledger) {
+  var startRow = ledger.dataStartRow;
+  var rowCount = Math.max(0, ledger.lastRow - startRow + 1);
+  var values = rowCount ? sheet.getRange(startRow, 1, rowCount, ledger.lastCol).getValues() : [];
+  var shown = rowCount ? sheet.getRange(startRow, ledger.nameCol, rowCount, 1).getDisplayValues() : [];
+
+  var tab = {
+    sheet: sheet,
+    nameCol: ledger.nameCol,
+    insuranceCol: ledger.insuranceCol,
+    lastCol: ledger.lastCol,
+    startRow: startRow,
+    nameCells: [],
+    days: [],
+    patients: [],
+    lastFilledRow: 0
+  };
+  var currentDay = null;
+
+  for (var r = 0; r < rowCount; r++) {
+    var sheetRow = startRow + r;
+    var cell = values[r][ledger.nameCol - 1];
+    tab.nameCells.push(cell);
+    if (!isNameCellEmpty_(tab, sheetRow)) {
+      tab.lastFilledRow = sheetRow;
+    }
+
+    var dayDate = parseHeadingDate_(cell);
+    if (dayDate) {
+      currentDay = { date: dayDate, row: sheetRow, value: cell, shown: shown[r][0], lastRow: sheetRow, patients: [] };
+      tab.days.push(currentDay);
+      continue;
+    }
+
+    var text = cleanText_(cell);
+    if (!text || /^closed$/i.test(text)) {
+      continue;
+    }
+    var patient = { row: sheetRow, text: text, insurance: ledger.insuranceCol ? values[r][ledger.insuranceCol - 1] : '' };
+    tab.patients.push(patient);
+    if (currentDay) {
+      currentDay.patients.push(patient);
+      currentDay.lastRow = sheetRow;
+    }
+  }
+
+  return tab;
+}
+
+/** True if the tab's name cell on sheetRow is empty. */
+function isNameCellEmpty_(tab, sheetRow) {
+  var cell = tab.nameCells[sheetRow - tab.startRow];
+  return !(cell instanceof Date) && !cleanText_(cell);
+}
+
+/** The tab's days whose date row is visitDate. */
+function daysOn_(tab, visitDate) {
+  var dateKey = normalizeDateForCompare_(visitDate);
+  return tab.days.filter(function (day) {
+    return day.date === dateKey;
+  });
+}
+
+/** All patient rows under the given days. */
+function patientsOn_(days) {
+  var patients = [];
+  days.forEach(function (day) {
+    patients = patients.concat(day.patients);
+  });
+  return patients;
+}
+
+/**
+ * Refuses a tab whose last row is an "END" line (how a finished year's tab
+ * gets closed off), since a new day belongs on that year's new tab.
+ */
+function assertTabIsOpen_(tab) {
+  var lastText = tab.lastFilledRow ? cleanText_(tab.nameCells[tab.lastFilledRow - tab.startRow]) : '';
+  if (/^[-=_*.\s]*end[-=_*.\s]*$/i.test(lastText)) {
+    throw new Error('The "' + tab.sheet.getName() + '" tab ends with an END line, so it is closed. Pick the tab where this office\'s attendance goes now.');
+  }
+}
+
+/**
+ * The tab's patients, newest first, one entry per spelling, each with the
+ * insurance from that spelling's latest row that has one.
+ */
+function indexTabPatients_(tab) {
+  var bySpelling = {};
+  var index = [];
+  for (var i = tab.patients.length - 1; i >= 0; i--) {
+    var patient = tab.patients[i];
+    var name = stripListNumber_(patient.text);
+    var sortedKey = sortedNameKey_(name);
+    if (!sortedKey) {
+      continue;
+    }
+    var entry = bySpelling[sortedKey];
+    if (!entry) {
+      entry = { name: name, sortedKey: sortedKey, letterKey: letterNameKey_(name), insurance: '' };
+      bySpelling[sortedKey] = entry;
+      index.push(entry);
+    }
+    if (!entry.insurance && cleanText_(patient.insurance)) {
+      entry.insurance = patient.insurance;
+    }
+  }
+  return index;
+}
+
+/** The tab patient with the same name as the scanned one, in either order, or null. */
+function findTabPatient_(tabPatients, lastName, firstName) {
+  var firstNameFirst = firstName + ' ' + lastName;
+  var sortedKey = sortedNameKey_(firstNameFirst);
+  if (!sortedKey) {
+    return null;
+  }
+  var letterKeys = [letterNameKey_(firstNameFirst), letterNameKey_(lastName + ' ' + firstName)];
+  for (var i = 0; i < tabPatients.length; i++) {
+    if (tabPatients[i].sortedKey === sortedKey || letterKeys.indexOf(tabPatients[i].letterKey) !== -1) {
+      return tabPatients[i];
+    }
+  }
+  return null;
+}
+
+/**
+ * The tab patient whose name is one letter off the scanned one (two for
+ * long names), for a name the handwriting or the scan got slightly wrong;
+ * the newest such patient wins a tie. Null when nothing is that close.
+ */
+function closestTabPatient_(tabPatients, lastName, firstName) {
+  var targets = [
+    sortedNameKey_(firstName + ' ' + lastName).replace(/ /g, ''),
+    letterNameKey_(firstName + ' ' + lastName),
+    letterNameKey_(lastName + ' ' + firstName)
+  ];
+  var length = targets[0].length;
+  if (length < 5) {
+    return null;
+  }
+  var best = null;
+  var bestDistance = length >= 12 ? 3 : 2; // a match has to be closer than this
+  tabPatients.forEach(function (entry) {
+    var candidates = [entry.sortedKey.replace(/ /g, ''), entry.letterKey, entry.letterKey];
+    for (var i = 0; i < targets.length; i++) {
+      if (Math.abs(candidates[i].length - targets[i].length) >= bestDistance) {
+        continue;
+      }
+      var distance = editDistance_(targets[i], candidates[i]);
+      if (distance < bestDistance) {
+        best = entry;
+        bestDistance = distance;
+      }
+    }
+  });
+  return best;
+}
+
+/** Number of single-letter changes that turn one string into the other. */
+function editDistance_(a, b) {
+  var previous = [];
+  for (var j = 0; j <= b.length; j++) {
+    previous.push(j);
+  }
+  for (var i = 1; i <= a.length; i++) {
+    var current = [i];
+    for (var k = 1; k <= b.length; k++) {
+      var cost = a.charAt(i - 1) === b.charAt(k - 1) ? 0 : 1;
+      current.push(Math.min(previous[k] + 1, current[k - 1] + 1, previous[k - 1] + cost));
+    }
+    previous = current;
+  }
+  return previous[b.length];
+}
+
+/**
+ * Counts whether a name the tab already has starts with the patient's last
+ * name or first name, to tell how the tab orders names without a comma.
+ */
+function voteNameOrder_(votes, tabName, lastName, firstName) {
+  if (tabName.indexOf(',') !== -1) {
+    return;
+  }
+  var firstWord = foldPatientName_(tabName).split(' ')[0];
+  if (firstWord && firstWord === foldPatientName_(lastName).split(' ')[0]) {
+    votes.lastNameFirst++;
+  } else if (firstWord && firstWord === foldPatientName_(firstName).split(' ')[0]) {
+    votes.firstNameFirst++;
+  }
+}
+
+/**
+ * How a tab writes patient names, from its latest patient rows: list
+ * numbers ("10. JOHN SMITH"), "LAST,FIRST" with a comma, capitals, and,
+ * from the scanned patients already on the tab, which name goes first when
+ * there is no comma.
+ */
+function attendanceNameStyle_(tab, nameOrderVotes) {
+  var recent = tab.patients.slice(-ATTENDANCE_STYLE_ROWS).map(function (patient) {
+    return patient.text;
+  });
+  var numbered = recent.filter(function (text) {
+    return /^\s*\d+\s*[.)]/.test(text);
+  });
+  var names = recent.map(stripListNumber_);
+  var withComma = names.filter(function (name) {
+    return name.indexOf(',') !== -1;
+  });
+  var capitals = names.filter(function (name) {
+    return /[A-Za-z]/.test(name) && name === name.toUpperCase();
+  });
+
+  return {
+    numbered: numbered.length * 2 > recent.length,
+    numberEnd: numbered.filter(function (text) { return /^\s*\d+\s*[.)]\s/.test(text); }).length * 2 >= numbered.length ? '. ' : '.',
+    comma: withComma.length * 2 > recent.length,
+    commaEnd: withComma.filter(function (name) { return /,\s/.test(name); }).length * 2 > withComma.length ? ', ' : ',',
+    capitals: !recent.length || capitals.length >= recent.length * 0.6,
+    lastNameFirst: nameOrderVotes.lastNameFirst > nameOrderVotes.firstNameFirst
+  };
+}
+
+/**
+ * A name for a patient who isn't on the tab yet, written the way the tab
+ * writes names. Accents are dropped, since EOBs spell names without them
+ * and reconcilePayments matches by name.
+ */
+function formatNewPatientName_(style, lastName, firstName) {
+  var last = removeAccents_(lastName);
+  var first = removeAccents_(firstName);
+  var name;
+  if (!last || !first) {
+    name = last || first;
+  } else if (style.comma) {
+    name = last + style.commaEnd + first;
+  } else {
+    name = style.lastNameFirst ? last + ' ' + first : first + ' ' + last;
+  }
+  return style.capitals ? name.toUpperCase() : name.toLowerCase().replace(/(^|[\s,'-])([a-z])/g, function (all, before, letter) {
+    return before + letter.toUpperCase();
+  });
+}
+
+/**
+ * Puts a new day below the tab's last row: the same empty separator rows
+ * the latest day has above its date row, a date row written like the
+ * latest one, the same empty rows it has before its first patient, then
+ * the patients, each row formatted like its counterpart in the latest day.
+ */
+function addNewDay_(tab, visitDate, toAdd, style) {
+  var sheet = tab.sheet;
+  var layout = latestDayLayout_(tab);
+  var dateRow = attendanceDateRow_(tab, visitDate);
+  var total = layout.spacersAbove.length + 1 + layout.spacersBelow.length + toAdd.length;
+  var start = Math.max(tab.lastFilledRow, tab.startRow - 1) + 1;
+  makeRoom_(tab, start, total);
+
+  var row = start;
+  layout.spacersAbove.forEach(function (templateRow) {
+    copyRowFormat_(tab, templateRow, row, row);
+    row++;
+  });
+
+  var dateRowNumber = row;
+  if (layout.dateRow) {
+    copyRowFormat_(tab, layout.dateRow, dateRowNumber, dateRowNumber);
+  }
+  var dateCell = sheet.getRange(dateRowNumber, tab.nameCol);
+  dateCell.setValue(dateRow.value);
+  if (dateRow.numberFormat) {
+    dateCell.setNumberFormat(dateRow.numberFormat);
+  }
+  row++;
+
+  layout.spacersBelow.forEach(function (templateRow) {
+    copyRowFormat_(tab, templateRow, row, row);
+    row++;
+  });
+
+  writePatientRows_(tab, row, toAdd, style, 1, layout.patientRow);
+  return { dateRow: dateRow.text, firstRow: dateRowNumber, lastRow: row + toAdd.length - 1 };
+}
+
+/**
+ * Adds patients to a day that is already on the tab, in new rows inserted
+ * right after its last patient (or its date row), formatted like its last
+ * patient row and continuing its list numbers.
+ */
+function addToExistingDay_(tab, day, toAdd, style) {
+  var lastPatient = day.patients[day.patients.length - 1];
+  var templateRow = lastPatient ? lastPatient.row : latestDayLayout_(tab).patientRow;
+  if (templateRow > day.lastRow) {
+    templateRow += toAdd.length; // that row moves down when the new rows go in above it
+  }
+  var nextNumber = 1;
+  day.patients.forEach(function (patient) {
+    var number = patient.text.match(/^\s*(\d+)\s*[.)]/);
+    nextNumber = Math.max(nextNumber, number ? Number(number[1]) + 1 : nextNumber + 1);
+  });
+
+  tab.sheet.insertRowsAfter(day.lastRow, toAdd.length);
+  var firstRow = day.lastRow + 1;
+  writePatientRows_(tab, firstRow, toAdd, style, nextNumber, templateRow);
+  return { firstRow: firstRow, lastRow: firstRow + toAdd.length - 1 };
+}
+
+/**
+ * Where the tab's latest day sits, so a new day can copy its layout: the
+ * empty rows just above its date row (blank or colored separator rows; only
+ * when an earlier day sits above them), its date row, the empty rows
+ * between its date row and its first patient, and its last patient row.
+ */
+function latestDayLayout_(tab) {
+  var lastPatient = tab.patients[tab.patients.length - 1];
+  var layout = { spacersAbove: [], dateRow: 0, spacersBelow: [], patientRow: lastPatient ? lastPatient.row : 0 };
+  var day = tab.days[tab.days.length - 1];
+  if (!day) {
+    return layout;
+  }
+  layout.dateRow = day.row;
+
+  if (day.patients.length) {
+    layout.patientRow = day.patients[day.patients.length - 1].row;
+    for (var below = day.row + 1; below < day.patients[0].row && isNameCellEmpty_(tab, below) &&
+      layout.spacersBelow.length < ATTENDANCE_MAX_SPACER_ROWS; below++) {
+      layout.spacersBelow.push(below);
+    }
+  }
+
+  var above = [];
+  for (var row = day.row - 1; row >= tab.startRow && isNameCellEmpty_(tab, row) &&
+    above.length < ATTENDANCE_MAX_SPACER_ROWS; row--) {
+    above.unshift(row);
+  }
+  if (above.length && above[0] > tab.startRow) {
+    layout.spacersAbove = above;
+  }
+  return layout;
+}
+
+/**
+ * The date row for a new day, written like the tab's latest date row: the
+ * same kind of value (a real date cell, or text like "01/04/24(THU.)" or
+ * "March 16,2026(MON.)"), without its "(billed)" mark. Text is written with
+ * a leading apostrophe so Sheets keeps it as typed instead of turning it
+ * into a date. A date cell gets the noon of that day, so it shows the same
+ * day in any time zone.
+ *
+ * @return {{value: (Date|string), text: string, numberFormat: string}}
+ */
+function attendanceDateRow_(tab, visitDate) {
+  var latestDay = tab.days[tab.days.length - 1];
+  var text = dateRowTextLike_(latestDay ? cleanText_(latestDay.shown) : '', visitDate);
+  if (parseHeadingDate_(text) !== normalizeDateForCompare_(visitDate)) {
+    text = formatVisitDate_(visitDate);
+  }
+
+  if (latestDay && latestDay.value instanceof Date) {
+    var numberFormat = '';
+    var latestFormat = String(tab.sheet.getRange(latestDay.row, tab.nameCol).getNumberFormat() || '');
+    if (/billed/i.test(latestFormat)) {
+      numberFormat = latestFormat.replace(/\s*"[^"]*billed[^"]*"/ig, '');
+      if (/billed/i.test(numberFormat) || !numberFormat.trim()) {
+        numberFormat = 'mm/dd/yyyy';
+      }
+    }
+    return { value: visitDate, text: text, numberFormat: numberFormat };
+  }
+  return { value: '\'' + text, text: text, numberFormat: '' };
+}
+
+/**
+ * Writes visitDate the way the sample date row is written: "01/04/24(THU.)"
+ * gives "11/09/26(MON.)" and "March 16,2026(MON.) (billed)" gives
+ * "November 09,2026(MON.)", keeping zero-padding, a two- or four-digit
+ * year, a short or long month name and the weekday in brackets when the
+ * sample has them. Anything else gives MM/DD/YYYY.
+ */
+function dateRowTextLike_(sample, visitDate) {
+  var text = String(sample || '').replace(/\(\s*billed\s*\)/ig, '').replace(/\s+$/, '');
+  var month = visitDate.getMonth() + 1;
+  var day = visitDate.getDate();
+  var year = visitDate.getFullYear();
+  var weekday = WEEKDAY_NAMES[visitDate.getDay()];
+
+  var numeric = text.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4}|\d{2})(\s*\(\s*([A-Za-z]{3,4})(\.?)\s*\))?/);
+  if (numeric) {
+    var padded = numeric[1].length === 2 || numeric[2].length === 2;
+    return (padded ? pad2_(month) : month) + '/' + (padded ? pad2_(day) : day) + '/' +
+      (numeric[3].length === 2 ? pad2_(year % 100) : year) +
+      (numeric[4] ? weekdayLike_(numeric[4], numeric[5], numeric[6], weekday) : '');
+  }
+
+  var written = text.match(/^([A-Za-z]{3,9})(\.?)(\s+)(\d{1,2})(\s*),(\s*)(\d{4})(\s*\(\s*([A-Za-z]{3,4})(\.?)\s*\))?/);
+  if (written) {
+    var fullName = MONTH_NAMES[month - 1];
+    var sampleIsFull = MONTH_NAMES.some(function (name) {
+      return name.toLowerCase() === written[1].toLowerCase();
+    });
+    var monthText = sampleIsFull ? fullName : fullName.slice(0, 3) + written[2];
+    if (written[1] === written[1].toUpperCase()) {
+      monthText = monthText.toUpperCase();
+    }
+    return monthText + written[3] + (written[4].length === 2 ? pad2_(day) : day) + written[5] + ',' + written[6] + year +
+      (written[8] ? weekdayLike_(written[8], written[9], written[10], weekday) : '');
+  }
+
+  return formatVisitDate_(visitDate);
+}
+
+/** "(MON.)" for visitDate's weekday, spaced, cased and dotted like the sample "(THU.)". */
+function weekdayLike_(sampleWhole, sampleWeekday, sampleDot, weekday) {
+  var before = sampleWhole.match(/^\s*/)[0];
+  var name = sampleWeekday === sampleWeekday.toUpperCase() ? weekday : weekday.charAt(0) + weekday.slice(1).toLowerCase();
+  return before + '(' + name + sampleDot + ')';
+}
+
+/**
+ * Makes sure rows start..start+count-1 are empty in every column: adds rows
+ * at the bottom when the tab is too short, and inserts fresh rows at start
+ * when anything is already there, so nothing gets written over.
+ */
+function makeRoom_(tab, start, count) {
+  var sheet = tab.sheet;
+  var maxRows = sheet.getMaxRows();
+  var existing = Math.max(0, Math.min(count, maxRows - start + 1));
+  var inUse = false;
+  if (existing > 0) {
+    var range = sheet.getRange(start, 1, existing, tab.lastCol);
+    var formulas = range.getFormulas();
+    inUse = range.getValues().some(function (rowValues, i) {
+      return rowValues.some(function (value, j) {
+        return cleanText_(value) !== '' || value instanceof Date || !!formulas[i][j];
+      });
+    });
+  }
+  if (inUse) {
+    sheet.insertRowsBefore(start, count);
+  } else if (start + count - 1 > maxRows) {
+    sheet.insertRowsAfter(maxRows, start + count - 1 - maxRows);
+  }
+}
+
+/** Copies one row's formatting (all of the tab's columns) onto rows toFirstRow..toLastRow. */
+function copyRowFormat_(tab, fromRow, toFirstRow, toLastRow) {
+  tab.sheet.getRange(fromRow, 1, 1, tab.lastCol).copyFormatToRange(tab.sheet, 1, tab.lastCol, toFirstRow, toLastRow);
+}
+
+/**
+ * Writes the patients from firstRow down: formatting copied from
+ * templateRow, the name (numbered from firstNumber when the tab numbers
+ * its lists) and, when the tab has an Insurance column, the insurance.
+ */
+function writePatientRows_(tab, firstRow, toAdd, style, firstNumber, templateRow) {
+  var lastRow = firstRow + toAdd.length - 1;
+  if (templateRow) {
+    copyRowFormat_(tab, templateRow, firstRow, lastRow);
+  }
+  tab.sheet.getRange(firstRow, tab.nameCol, toAdd.length, 1).setValues(toAdd.map(function (entry, i) {
+    var name = (style.numbered ? (firstNumber + i) + style.numberEnd : '') + entry.name;
+    return [/^[=+@-]/.test(name) ? '\'' + name : name];
+  }));
+  if (tab.insuranceCol) {
+    tab.sheet.getRange(firstRow, tab.insuranceCol, toAdd.length, 1).setValues(toAdd.map(function (entry) {
+      return [/^[=+@-]/.test(entry.insurance) ? '\'' + entry.insurance : entry.insurance];
+    }));
+  }
+}
+
+/**
+ * Reads a visit date written as M/D/YY or MM/DD/YYYY (with slashes, dashes or
+ * dots) or spelled out, and returns noon of that day, which stays the same
+ * calendar day in any time zone. Null for anything else, including
+ * impossible dates like 2/30.
+ */
+function parseVisitDate_(value) {
+  if (value instanceof Date) {
+    return isNaN(value.getTime()) ? null : new Date(value.getFullYear(), value.getMonth(), value.getDate(), 12);
+  }
+  var text = cleanText_(value);
+  var parts = text.match(/^(\d{1,2})\s*[\/.-]\s*(\d{1,2})\s*[\/.-]\s*(\d{2}|\d{4})$/);
+  if (parts) {
+    var month = Number(parts[1]);
+    var day = Number(parts[2]);
+    var year = Number(parts[3]) + (parts[3].length === 2 ? 2000 : 0);
+    var date = new Date(year, month - 1, day, 12);
+    return date.getMonth() === month - 1 && date.getDate() === day ? date : null;
+  }
+  var parsed = /\d{4}/.test(text) ? new Date(text) : new Date(NaN);
+  return isNaN(parsed.getTime()) ? null : new Date(parsed.getFullYear(), parsed.getMonth(), parsed.getDate(), 12);
+}
+
+/** A date as MM/DD/YYYY. */
+function formatVisitDate_(date) {
+  return pad2_(date.getMonth() + 1) + '/' + pad2_(date.getDate()) + '/' + date.getFullYear();
+}
+
+/** A number as at least two digits. */
+function pad2_(number) {
+  return (number < 10 ? '0' : '') + number;
+}
+
+/** A cell value or scanned text as a trimmed single-spaced string ('' for empty or missing). */
+function cleanText_(value) {
+  if (value === null || value === undefined) {
+    return '';
+  }
+  return String(value).replace(/\s+/g, ' ').trim();
+}
+
+/** A name without the list number the sheet puts in front of it ("10. JOHN SMITH"). */
+function stripListNumber_(text) {
+  return cleanText_(text).replace(/^\d+\s*[.)]\s*/, '');
+}
+
+/** Text with accented letters replaced by plain ones ("MU\u00d1OZ" -> "MUNOZ"). */
+function removeAccents_(text) {
+  return cleanText_(text).replace(/[\u00c0-\u00ff]/g, function (letter) {
+    var lower = letter.toLowerCase();
+    var plain = ACCENTED_LETTERS[lower];
+    if (!plain) {
+      return letter;
+    }
+    return letter === lower ? plain : plain.toUpperCase();
+  });
+}
+
+/**
+ * A name reduced for matching: list number, accents, punctuation and
+ * capitals dropped ("21. MU\u00d1OZ-LOPEZ, Ana" -> "munoz lopez ana").
+ */
+function foldPatientName_(name) {
+  return removeAccents_(stripListNumber_(name)).toLowerCase().replace(/[^a-z]+/g, ' ').trim();
+}
+
+/** The words of a name in sorted order, so "Last, First" and "First Last" give the same key. */
+function sortedNameKey_(name) {
+  return foldPatientName_(name).split(' ').sort().join(' ');
+}
+
+/** Just the letters of a name in order, so "ANA MARIA" and "ANAMARIA" give the same key. */
+function letterNameKey_(name) {
+  return foldPatientName_(name).replace(/ /g, '');
+}
+
+/** True if two names are the same patient under either key. Empty names never match. */
+function samePatientName_(nameA, nameB) {
+  var sortedA = sortedNameKey_(nameA);
+  if (!sortedA) {
+    return false;
+  }
+  return sortedA === sortedNameKey_(nameB) || letterNameKey_(nameA) === letterNameKey_(nameB);
+}
+
+/* ---------------------------------------------------------------------
+ * Usage log: one row per EOB scan, reconcile, sign-in scan and sign-in
+ * add on a "Scanner Log" tab, with totals for this month and all time at
+ * the top, to see how much the scanners get used. It only records counts,
+ * tab names and error messages, never patient names.
+ * ------------------------------------------------------------------- */
+
+/** The tab the usage log is kept on (made the first time something is logged). */
+var USAGE_LOG_TAB = 'Scanner Log';
+
+/** The row of the log's first entry; above it are a title, the totals and the column headings. */
+var USAGE_LOG_FIRST_ROW = 10;
+
+/** The kinds of use counted in the totals, as written in the log's "What" column. */
+var USAGE_LOG_ACTIONS = ['Scan EOB', 'Reconcile', 'Scan sign-in sheet', 'Add sign-in patients'];
+
+/**
+ * Opens the Scanner Log tab (from the menu), making it first if nothing
+ * has been logged yet.
+ */
+function showUsageLog() {
+  getUsageLog_(SpreadsheetApp.getActiveSpreadsheet()).activate();
+}
+
+/**
+ * Adds one row to the usage log: when, which scanner, what was done,
+ * whether it worked, and details such as how many rows. Callers pass only
+ * counts, tab names and error messages; an error that quotes Gemini's
+ * reply is cut before the reply, since that could hold patient names. A
+ * problem with the log itself is ignored: it must never stop a scan or a
+ * reconcile.
+ */
+function logUsage_(scanner, what, worked, details) {
+  try {
+    var text = String(details || '').replace(/(not valid JSON)[\s\S]*$/, '$1');
+    if (text.length > 200) {
+      text = text.slice(0, 197) + '...';
+    }
+    getUsageLog_(SpreadsheetApp.getActiveSpreadsheet())
+      .appendRow([new Date(), scanner, what, worked ? 'Worked' : 'Failed', text]);
+  } catch (logErrorIgnored) {
+    // the scan or reconcile matters more than its log entry
+  }
+}
+
+/**
+ * The Scanner Log tab, made the first time it is needed, after the last
+ * tab: a title, the totals for each kind of use (this month and all time,
+ * counting the uses that worked) and the column headings, all above
+ * USAGE_LOG_FIRST_ROW. Whoever is using a scanner stays on the tab they
+ * had open.
+ */
+function getUsageLog_(spreadsheet) {
+  var log = spreadsheet.getSheetByName(USAGE_LOG_TAB);
+  if (log) {
+    return log;
+  }
+
+  var openTab = spreadsheet.getActiveSheet();
+  log = spreadsheet.insertSheet(USAGE_LOG_TAB, spreadsheet.getNumSheets());
+
+  log.getRange(1, 1).setValue('Scanner usage').setFontWeight('bold').setFontSize(12);
+  log.getRange(2, 1).setValue('One row per use, newest at the bottom. The totals count the uses that worked. ' +
+    'Patient names are never logged.').setFontColor('#6b7280');
+  log.getRange(3, 1, 1, 3).setValues([['What', 'This month', 'All time']]).setFontWeight('bold');
+
+  var first = USAGE_LOG_FIRST_ROW;
+  log.getRange(4, 1, USAGE_LOG_ACTIONS.length, 3).setValues(USAGE_LOG_ACTIONS.map(function (action, i) {
+    var worked = '$C$' + first + ':$C,$A' + (4 + i) + ',$D$' + first + ':$D,"<>Failed"';
+    return [
+      action,
+      '=COUNTIFS(' + worked + ',$A$' + first + ':$A,">="&EOMONTH(TODAY(),-1)+1)',
+      '=COUNTIFS(' + worked + ')'
+    ];
+  }));
+
+  log.getRange(first - 1, 1, 1, 5).setValues([['When', 'Scanner', 'What', 'Result', 'Details']])
+    .setFontWeight('bold').setBackground('#e6f4f7');
+  log.getRange(first, 1, log.getMaxRows() - first + 1, 1).setNumberFormat('m/d/yyyy h:mm am/pm');
+  [150, 110, 160, 70, 420].forEach(function (width, i) {
+    log.setColumnWidth(i + 1, width);
+  });
+
+  if (openTab) {
+    openTab.activate();
+  }
+  return log;
 }
